@@ -59,13 +59,6 @@ emotes.forEach(emote => {
 
 module.exports.emoteList = emotes;
 
-const games = {};
-module.exports.games = games;
-module.exports.userList = [];
-module.exports.generalChats = {
-	sticky: '',
-	list: []
-};
 module.exports.accountCreationDisabled = { status: false };
 module.exports.bypassVPNCheck = { status: false };
 module.exports.ipbansNotEnforced = { status: false };
