@@ -101,6 +101,7 @@ if (cluster.isMaster) {
 
 	const server = http.createServer(app);
 
+	global.redis = require('redis').createClient();
 	global.io = require('socket.io')(server);
 	global.notify = require('node-notifier');
 

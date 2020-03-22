@@ -14,7 +14,6 @@ const routesIndex = require('./routes/index');
 const session = require('express-session');
 const { expandAndSimplify } = require('./routes/socket/ip-obf');
 
-const redis = require('redis').createClient();
 const RedisStore = require('connect-redis')(session);
 const store = new RedisStore({
 	host: '127.0.0.1',
