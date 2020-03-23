@@ -1,5 +1,6 @@
 'use strict';
 
+const Redis = require('ioredis');
 const cluster = require('cluster');
 const debug = require('debug')('app:server');
 
@@ -101,7 +102,7 @@ if (cluster.isMaster) {
 
 	const server = http.createServer(app);
 
-	global.redis = require('redis').createClient();
+	global.redis = new Redis();
 	global.io = require('socket.io')(server);
 	global.notify = require('node-notifier');
 
