@@ -170,6 +170,8 @@ module.exports.games = { acquire, acquireAll, acquireEach };
  * Stores games in redis.
  * Note: Chat will not be saved if you changed it manually. See `pushChat` instead.
  *
+ * Be sure to acquire a write lock before calling this method.
+ *
  * @param {string|Object} keys - A key, or an object
  * @param {Object=} game - An optional game
  *
@@ -228,6 +230,34 @@ module.exports.games.get = async keys => {
  */
 module.exports.games.allKeys = async () => {
 	return redis.smembers('game+set:active');
+};
+
+module.exports.chatrooms = {};
+
+/**
+ * Push a new chat onto a game's chatroom.
+ * Note: You do not need to acquire a lock to push new chat.
+ *
+ * @param {string} key - A game cache key
+ * @param {Object|Object[]} chats - A chat object or array of chat objects
+ * @return {Promise<void>}
+ */
+module.exports.chatrooms.push = async (key, chats) => {
+	if (Array.isArray(chats)) {
+		return await redis.rpush(`game:${key}:chat`, chats.map(JSON.stringify));
+	} else {
+		return await redis.rpush(`game:${key}:chat`, JSON.stringify(chats));
+	}
+};
+
+/**
+ * Retrieves an entire chat log for a game.
+ *
+ * @param {string} key - A game cache key
+ * @return {Promise<Object[]>}
+ */
+module.exports.chatrooms.get = async key => {
+	return redis.get(keys).then(chats => chats.map(JSON.parse));
 };
 
 // set of profiles, no duplicate usernames
