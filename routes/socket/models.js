@@ -1,7 +1,10 @@
+/* removed temporarily
 const { CURRENTSEASONNUMBER } = require('../../src/frontend-scripts/node-constants');
 const Account = require('../../models/account');
 const ModAction = require('../../models/modAction');
 const BannedIP = require('../../models/bannedIP');
+*/
+const Mortice = require('mortice');
 
 const fs = require('fs');
 const emotes = [];
@@ -59,19 +62,6 @@ emotes.forEach(emote => {
 
 module.exports.emoteList = emotes;
 
-module.exports.accountCreationDisabled = { status: false };
-module.exports.bypassVPNCheck = { status: false };
-module.exports.ipbansNotEnforced = { status: false };
-module.exports.gameCreationDisabled = { status: false };
-module.exports.limitNewPlayers = { status: false };
-module.exports.newStaff = {
-	modUserNames: [],
-	editorUserNames: [],
-	altmodUserNames: [],
-	trialmodUserNames: [],
-	contributorUserNames: []
-};
-
 const staffList = [];
 Account.find({ staffRole: { $exists: true } }).then(accounts => {
 	accounts.forEach(user => (staffList[user.username] = user.staffRole));
@@ -107,6 +97,137 @@ module.exports.getPowerFromUser = user => {
 	if (module.exports.newStaff.trialmodUserNames.includes(user.userName)) return getPowerFromRole('trialmod');
 	if (module.exports.newStaff.contributorUserNames.includes(user.userName)) return getPowerFromRole('contributor');
 	return getPowerFromRole(user.staffRole);
+};
+
+module.exports.games = {};
+
+/**
+ * Waits for a lock on a single key.
+ *
+ * @param {string} key - a single key
+ * @return {Promise<Function>}
+ *
+ * @example
+ *
+ *     	const key = 'key1';
+ *      const release = await games.acquire(key);
+ *      let game = await games.get(key);
+ *      ...
+ *      await games.set(key, games);
+ *      release();
+ */
+async function acquire(key) {
+	return Mortice(key).writeLock();
+}
+
+/**
+ * Waits for a lock on every key in a set.
+ *
+ * @param {string[]} keys - a list of keys
+ * @return {Promise<Function>}
+ *
+ * @example
+ *
+ *     	const keys = ['key1', 'key2'];
+ *     	const release = await games.acquireAll(keys);
+ *     	let allGames = await games.get(keys);
+ *     	...
+ *     	await games.set(keys, allGames);
+ *     	release();
+ */
+async function acquireAll(keys) {
+	const releases = await Promise.all(keys.map(acquire));
+	return () => {
+		releases.forEach(release => release());
+	};
+}
+
+/**
+ * Waits for a lock on each individual key in a set.
+ *
+ * @param {string[]} keys - a list of keys
+ * @return {AsyncIterableIterator<{release: Function, key: string}>}
+ *
+ * @example
+ *
+ *     	const keys = ['key1', 'key2'];
+ *     	for await (const {release, key} of games.acquireEach(keys)) {
+ *     		let game = await games.get(key);
+ *     		...
+ *     		await games.set(key, game);
+ *     		release();
+ *     	}
+ */
+async function* acquireEach(keys) {
+	for (const key of keys) {
+		yield { key, release: await acquire(key) };
+	}
+}
+
+module.exports.games = { acquire, acquireAll, acquireEach };
+
+/**
+ * Stores games in redis.
+ * Note: Chat will not be saved if you changed it manually. See `pushChat` instead.
+ *
+ * @param {string|Object} keys - A key, or an object
+ * @param {Object=} game - An optional game
+ *
+ * @example
+ *
+ *     	games.set('key', game);
+ *      games.set({key1: game1, key2: game2});
+ */
+module.exports.games.set = async (keys, game) => {
+	if (typeof keys === 'string') {
+		delete game.chats;
+		return redis.set(`game:${keys}:data`, JSON.stringify(game));
+	} else {
+		keys.values().forEach(game => delete game.chats);
+		return redis.mset(keys);
+	}
+};
+
+/**
+ * Like games.set, but for when you are sure the game is not already in redis.
+ *
+ * @param {Object} game - A new game
+ * @return {string} - A cache key
+ */
+module.exports.games.register = async game => {
+	const key = game.general.uid;
+	const chats = [...game.chats];
+	delete game.chats;
+	await redis
+		.pipeline()
+		.set(`game:${key}:data`, JSON.stringify(game))
+		.rpush(`game:${key}:chat`, chats)
+		.sadd(`game+set:active`, key)
+		.exec();
+	return key;
+};
+
+/**
+ * Retrieves games from redis.
+ *
+ * @param {string|string[]} keys - A key or list of keys
+ * @return {Promise<Object[]>|Promise<Object>}
+ */
+module.exports.games.get = async keys => {
+	if (Array.isArray(keys)) {
+		return redis.mget(keys).then(strs => strs.map(JSON.parse));
+	} else {
+		return redis.get(keys).then(str => JSON.parse(json));
+	}
+};
+
+/**
+ * Retrieves the keys of all active games.
+ *
+ * @return {Promise<string[]>}
+ */
+module.exports.games.allKeys = async () => {
+	return redis.smembers('game+set:active');
 };
 
 // set of profiles, no duplicate usernames
