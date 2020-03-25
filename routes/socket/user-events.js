@@ -1,15 +1,9 @@
 const {
 	games,
-	userList,
+	userInfo,
+	groups,
 	userListEmitter,
-	generalChats,
-	accountCreationDisabled,
-	bypassVPNCheck,
-	ipbansNotEnforced,
-	gameCreationDisabled,
-	limitNewPlayers,
-	currentSeasonNumber,
-	newStaff,
+	genChat,
 	createNewBypass,
 	testIP
 } = require('./models');
@@ -37,6 +31,7 @@ const { LEGALCHARACTERS } = require('../../src/frontend-scripts/node-constants')
 const { makeReport } = require('./report.js');
 const { chatReplacements } = require('./chatReplacements');
 const generalChatReplTime = Array(chatReplacements.length + 1).fill(0);
+
 /**
  * @param {object} game - game to act on.
  * @return {string} status text.
@@ -61,9 +56,13 @@ const displayWaitingForPlayers = game => {
 };
 
 /**
- * @param {object} game - game to act on.
+ * Counts down to game creation, then passes games off to `startGame`
+ *
+ * @param {string} gameKey - A game cache key
+ * @param {Object} game - A game object
  */
-const startCountdown = game => {
+const startCountdown = async (gameKey, game) => {
+
 	if (game.gameState.isStarted) {
 		return;
 	}
@@ -71,13 +70,12 @@ const startCountdown = game => {
 	game.gameState.isStarted = true;
 	let startGamePause = game.general.isTourny ? 5 : 20;
 
-	const countDown = setInterval(() => {
+	while (true) {
 		if (game.gameState.cancellStart) {
 			game.gameState.cancellStart = false;
 			game.gameState.isStarted = false;
-			clearInterval(countDown);
+			return;
 		} else if (startGamePause === 4 || game.publicPlayersState.length === game.general.maxPlayersCount) {
-			clearInterval(countDown);
 
 			if (game.general.isTourny) {
 				const { queuedPlayers } = game.general.tournyInfo;
@@ -96,12 +94,12 @@ const startCountdown = game => {
 						io.sockets.sockets[socketId].handshake.session.passport && BPlayerNames.includes(io.sockets.sockets[socketId].handshake.session.passport.user)
 				);
 
-				gameA.general.uid = `${game.general.uid}TableA`;
+				gameA.general.uid = `${gameKey}TableA`;
 				gameA.general.minPlayersCount = gameA.general.maxPlayersCount = game.general.maxPlayersCount / 2;
 				gameA.publicPlayersState = APlayers;
 
 				const gameB = _.cloneDeep(gameA);
-				gameB.general.uid = `${game.general.uid}TableB`;
+				gameB.general.uid = `${gameKey}TableB`;
 				gameB.publicPlayersState = BPlayers;
 
 				ASocketIds.forEach(id => {
@@ -124,11 +122,12 @@ const startCountdown = game => {
 					socket.emit('joinGameRedirect', gameB.general.uid);
 				});
 
-				games.splice(games.indexOf(game), 1);
+				await games.remove(gameKey);
+
 				gameA.general.tournyInfo.round = gameB.general.tournyInfo.round = 1;
 				gameA.general.name = `${gameA.general.name}-tableA`;
 				gameB.general.name = `${gameB.general.name}-tableB`;
-				games.push(gameA, gameB);
+
 				delete gameA.general.tournyInfo.queuedPlayers;
 				delete gameB.general.tournyInfo.queuedPlayers;
 
@@ -144,8 +143,11 @@ const startCountdown = game => {
 						.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
 				}
 
-				startGame(gameA);
-				startGame(gameB);
+				const gameKeyA = await games.register(gameA);
+				const gameKeyB = await games.register(gameB);
+
+				startGame(gameKeyA, gameA);
+				startGame(gameKeyB, gameB);
 				sendGameList();
 			} else {
 				if (game.general.blindMode) {
@@ -156,8 +158,11 @@ const startCountdown = game => {
 						.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
 				}
 
-				startGame(game);
+				games.set(gameKey, game).then(release);
+
+				startGame(gameKey, game);
 			}
+			return;
 		} else {
 			game.general.status = game.general.isTourny
 				? `Tournament starts in ${startGamePause} second${startGamePause === 1 ? '' : 's'}.`
@@ -165,13 +170,15 @@ const startCountdown = game => {
 			io.in(game.general.uid).emit('gameUpdate', secureGame(game));
 		}
 		startGamePause--;
-	}, 1000);
+		await util.promisify(1000);
+	}
 };
 
 /**
- * @param {object} game - game to act on.
+ * @param {string} gameKey - A game cache key
+ * @param {Object} game - A game object
  */
-const checkStartConditions = game => {
+const checkStartConditions = async (gameKey, game) => {
 	if (game.gameState.isTracksFlipped) {
 		return;
 	}
@@ -193,30 +200,36 @@ const checkStartConditions = game => {
 		(game.general.isTourny && game.general.tournyInfo.queuedPlayers.length === game.general.maxPlayersCount)
 	) {
 		game.remakeData = game.publicPlayersState.map(player => ({ userName: player.userName, isRemaking: false, remakeTime: 0 }));
-		startCountdown(game);
+		await startCountdown(gameKey, game);
 	} else if (!game.gameState.isStarted) {
 		game.general.status = displayWaitingForPlayers(game);
 	}
 };
 
 /**
- * @param {object} game - game to act on.
- * @param {string} playerName - name of player leaving pretourny.
+ * @param {string} gameKey - A game cache key
+ * @param {string} playerKey - A player cache key
  */
-const playerLeavePretourny = (game, playerName) => {
+const playerLeavePretourny = async (gameKey, playerKey) => {
+	const release = await games.acquire(gameKey);
+	const game = await games.get(gameKey);
+
 	const { queuedPlayers } = game.general.tournyInfo;
 
 	if (queuedPlayers.length === 1) {
-		games.splice(games.indexOf(game), 1);
+		await games.remove(gameKey);
 		return;
 	}
 
 	queuedPlayers.splice(
-		queuedPlayers.findIndex(player => player.userName === playerName),
+		queuedPlayers.findIndex(player => player.userName === playerKey),
 		1
 	);
 
-	game.chats.push({
+	game.general.status = displayWaitingForPlayers(game);
+	games.set(gameKey, game).then(release);
+
+	await games.chatPush(gameKey, {
 		timestamp: new Date(),
 		gameChat: true,
 		chat: [
@@ -229,96 +242,74 @@ const playerLeavePretourny = (game, playerName) => {
 			}
 		]
 	});
-	game.general.status = displayWaitingForPlayers(game);
+
 	sendInProgressGameUpdate(game);
 };
 
 /**
  * @param {object} socket - user socket reference.
  */
-const handleSocketDisconnect = socket => {
+const handleSocketDisconnect = async socket => {
 	const { passport } = socket.handshake.session;
 
 	let listUpdate = false;
 	if (passport && Object.keys(passport).length) {
-		const userIndex = userList.findIndex(user => user.userName === passport.user);
-		const gameNamesPlayerSeatedIn = Object.keys(games).filter(gameName =>
-			games[gameName].publicPlayersState.find(player => player.userName === passport.user && !player.leftGame)
-		);
 
-		if (userIndex !== -1) {
-			userList.splice(userIndex, 1);
-			listUpdate = true;
-		}
+		const gameKey = userInfo.get(passport.user);
+		await groups.remove('online', passport.user);
 
-		if (gameNamesPlayerSeatedIn.length) {
-			gameNamesPlayerSeatedIn.forEach(gameName => {
-				const game = games[gameName];
-				const { gameState, publicPlayersState } = game;
-				const playerIndex = publicPlayersState.findIndex(player => player.userName === passport.user);
+		if (gameKey !== null) {
+			const release = await games.acquire(gameKey);
+			const game = await games.get(gameKey);
 
-				if (
-					(!gameState.isStarted && publicPlayersState.length === 1) ||
-					(gameState.isCompleted && publicPlayersState.filter(player => !player.connected || player.leftGame).length === game.general.playerCount - 1)
-				) {
-					delete games[gameName];
-				} else if (!gameState.isTracksFlipped && playerIndex > -1) {
-					publicPlayersState.splice(playerIndex, 1);
-					checkStartConditions(game);
-					io.sockets.in(game.uid).emit('gameUpdate', game);
-				} else if (gameState.isTracksFlipped) {
-					publicPlayersState[playerIndex].connected = false;
-					publicPlayersState[playerIndex].leftGame = true;
-					const playerRemakeData = game.remakeData && game.remakeData.find(player => player.userName === passport.user);
-					if (playerRemakeData && playerRemakeData.isRemaking) {
-						const minimumRemakeVoteCount = game.general.playerCount - game.customGameSettings.fascistCount;
-						const remakePlayerCount = game.remakeData.filter(player => player.isRemaking).length;
+			const { gameState, publicPlayersState } = game;
+			const playerIndex = publicPlayersState.findIndex(player => player.userName === passport.user);
 
-						if (!game.general.isRemade && game.general.isRemaking && remakePlayerCount <= minimumRemakeVoteCount) {
-							game.general.isRemaking = false;
-							game.general.status = 'Game remaking has been cancelled.';
-							clearInterval(game.private.remakeTimer);
-						}
-						const chat = {
-							timestamp: new Date(),
-							gameChat: true,
-							chat: [
-								{
-									text: 'A player'
-								}
-							]
-						};
-						chat.chat.push({
-							text: ` has left and rescinded their vote to ${game.general.isTourny ? 'cancel this tournament.' : 'remake this game.'} (${remakePlayerCount -
-								1}/${minimumRemakeVoteCount})`
-						});
-						game.chats.push(chat);
-						game.remakeData.find(player => player.userName === passport.user).isRemaking = false;
+			if (
+				(!gameState.isStarted && publicPlayersState.length === 1) ||
+				(gameState.isCompleted && publicPlayersState.filter(player => !player.connected || player.leftGame).length === game.general.playerCount - 1)
+			) {
+				// Remove games when the last player leaves
+				games.remove(gameKey).then(release);
+			} else if (!gameState.isTracksFlipped && playerIndex > -1) {
+				publicPlayersState.splice(playerIndex, 1);
+				await checkStartConditions(gameKey, game);
+				io.sockets.in(gameKey).emit('gameUpdate', game);
+			} else if (gameState.isTracksFlipped) {
+				publicPlayersState[playerIndex].connected = false;
+				publicPlayersState[playerIndex].leftGame = true;
+				const playerRemakeData = game.remakeData && game.remakeData.find(player => player.userName === passport.user);
+				if (playerRemakeData && playerRemakeData.isRemaking) {
+					const minimumRemakeVoteCount = game.general.playerCount - game.customGameSettings.fascistCount;
+					const remakePlayerCount = game.remakeData.filter(player => player.isRemaking).length;
+
+					if (!game.general.isRemade && game.general.isRemaking && remakePlayerCount <= minimumRemakeVoteCount) {
+						game.general.isRemaking = false;
+						game.general.status = 'Game remaking has been cancelled.';
+					}
+					const chat = {
+						timestamp: new Date(),
+						gameChat: true,
+						chat: [
+							{
+								text: 'A player'
+							}, {
+							  text: ` has left and rescinded their vote to ${game.general.isTourny ? 'cancel this tournament.' : 'remake this game.'} (${remakePlayerCount - 1}/${minimumRemakeVoteCount})`
+						  }
+						]
+					};
+					await games.chatPush(gameKey, chat);
+					game.remakeData.find(player => player.userName === passport.user).isRemaking = false;
 					}
 					sendInProgressGameUpdate(game);
 					if (game.publicPlayersState.filter(publicPlayer => publicPlayer.leftGame).length === game.general.playerCount) {
-						delete games[game.general.uid];
+						games.remove(gameKey).then(release);
+						return
 					}
 				}
-			});
-			sendGameList();
-			listUpdate = true;
+				games.set(gameKey, game).then(release);
+			}
 		}
-		//  else {
-		// 	const tournysPlayerQueuedIn = games.filter(
-		// 		game =>
-		// 			game.general.isTourny &&
-		// 			game.general.tournyInfo.queuedPlayers &&
-		// 			game.general.tournyInfo.queuedPlayers.map(player => player.userName).includes(passport.user)
-		// 	);
-
-		// 	tournysPlayerQueuedIn.forEach(game => {
-		// 		playerLeavePretourny(game, passport.user);
-		// 	});
-		// }
-	}
-	if (listUpdate) {
-		sendUserList();
 	}
 };
 
@@ -683,7 +674,6 @@ module.exports.handleAddNewGame = (socket, passport, data) => {
 		chats: [],
 		general: {
 			whitelistedPlayers: [],
-			uid: data.isTourny ? `${generateCombination(3, '', true)}Tournament` : uid,
 			name: user.isPrivate ? 'Private Game' : data.gameName ? data.gameName : 'New Game',
 			flag: data.flag || 'none', // TODO: verify that the flag exists, or that an invalid flag does not cause issues
 			minPlayersCount: playerCounts[0],
@@ -3956,16 +3946,14 @@ module.exports.handleHasSeenNewPlayerModal = socket => {
 
 /**
  * @param {object} socket - socket reference.
- * @param {function} callback - success callback.
  */
-module.exports.checkUserStatus = (socket, callback) => {
+module.exports.checkUserStatus = async (socket) => {
 	const { passport } = socket.handshake.session;
 
 	if (passport && Object.keys(passport).length) {
 		const { user } = passport;
 		const { sockets } = io.sockets;
 
-		const game = games[Object.keys(games).find(gameName => games[gameName].publicPlayersState.find(player => player.userName === user && !player.leftGame))];
 
 		const oldSocketID = Object.keys(sockets).find(
 			socketID =>
@@ -3980,28 +3968,26 @@ module.exports.checkUserStatus = (socket, callback) => {
 			delete sockets[oldSocketID];
 		}
 
-		const reconnectingUser = game ? game.publicPlayersState.find(player => player.userName === user) : undefined;
-
-		if (game && game.gameState.isStarted && !game.gameState.isCompleted && reconnectingUser) {
-			reconnectingUser.connected = true;
-			socket.join(game.general.uid);
-			socket.emit('updateSeatForUser');
-			sendInProgressGameUpdate(game);
+		const gameKey = await userInfo.get(user, 'currentGame');
+		if (gameKey !== null) {
+			const release = await games.acquire(gameKey);
+			const game = await games.get(gameKey);
+			if (game.gameState.isStarted && !game.gameState.isCompleted) {
+				game.publicPlayersState.find(player => player.userName === user).connected = true;
+				games.set(gameKey, game).then(release);
+				socket.join(game.general.uid);
+				socket.emit('updateSeatForUser');
+			}
 		}
 
 		if (user) {
 			// Double-check the user isn't sneaking past IP bans.
-			const logOutUser = username => {
-				const bannedUserlistIndex = userList.findIndex(user => user.userName === username);
+			const logOutUser = async userKey => {
 
 				socket.emit('manualDisconnection');
 				socket.disconnect(true);
 
-				if (bannedUserlistIndex >= 0) {
-					userList.splice(bannedUserlistIndex, 1);
-				}
-
-				// destroySession(username);
+				await groups.remove("online", userKey);
 			};
 
 			Account.findOne({ username: user }, function(err, account) {

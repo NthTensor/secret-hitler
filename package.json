@@ -29,6 +29,7 @@
 		"gfycat-style-urls": "git://github.com/cozuya/gfycat-style-urls.git",
 		"ioredis": "^4.16.0",
 		"immutable": "^4.0.0-rc.6",
+		"interval-promise": "^1.4.0",
 		"isomorphic-fetch": "^2.2.1",
 		"jimp": "^0.6.0",
 		"jquery": "^3.2.1",

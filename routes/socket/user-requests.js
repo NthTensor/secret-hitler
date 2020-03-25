@@ -193,12 +193,12 @@ module.exports.sendUserGameSettings = socket => {
 			getProfile(passport.user);
 			if (!userListNames.includes(passport.user)) {
 				const userListInfo = {
-					userName: passport.user,
-					staffRole: account.staffRole || '',
-					isContributor: account.isContributor || false,
-					staffDisableVisibleElo: account.gameSettings.staffDisableVisibleElo,
-					staffDisableStaffColor: account.gameSettings.staffDisableStaffColor,
-					staffIncognito: account.gameSettings.staffIncognito,
+					userName: passport.user,                                       // user
+					staffRole: account.staffRole || '',                            // group
+					isContributor: account.isContributor || false,                 // group
+					staffDisableVisibleElo: account.gameSettings.staffDisableVisibleElo, // user
+					staffDisableStaffColor: account.gameSettings.staffDisableStaffColor, // user
+					staffIncognito: account.gameSettings.staffIncognito,           // user
 					wins: account.wins,
 					losses: account.losses,
 					rainbowWins: account.rainbowWins,
@@ -332,16 +332,41 @@ const updateUserStatus = (module.exports.updateUserStatus = (passport, game, ove
 });
 
 /**
- * @param {object} socket - user socket reference.
- * @param {string} uid - uid of game.
+ * @param {object} socket - A user socket reference
+ * @param {string} gameKey - A game cache key
+ * @param {string} [userKey] - An optional user cache key
  */
-module.exports.sendGameInfo = (socket, uid) => {
-	const game = games[uid];
-	const { passport } = socket.handshake.session;
+module.exports.sendGameInfo = async (socket, gameKey, userKey) => {
 
-	if (game) {
-		if (passport && Object.keys(passport).length) {
-			const player = game.publicPlayersState.find(player => player.userName === passport.user);
+	if (userKey != null) {
+		const release = await games.acquire(gameKey);
+		const game = await games.get(gameKey);
+		if (game == null) {
+			release();
+			const game = await Game.findOne({ uid: gameKey });
+			socket.emit('manualReplayRequest', game ? game.uid : '');
+			return;
+		}
+
+		const player = game.publicPlayersState.find(player => player.userName === userKey);
+
+		if (player) {
+			player.leftGame = false;
+			player.connected = true;
+			socket.emit('updateSeatForUser', true);
+			updateUserStatus(passport, game);
+		} else {
+			updateUserStatus(passport, game, 'observing');
+		}
+
+		release();
+	} else {
+		const game = await games.get(gameKey);
+	}
+
+	if (game !== null) {
+		if (userKey != null) {
+			const player = game.publicPlayersState.find(player => player.userName === userKey);
 
 			if (player) {
 				player.leftGame = false;
