@@ -15,13 +15,11 @@ const {
 	handlePlayerReportDismiss,
 	handleUpdatedBio,
 	handleUpdatedRemakeGame,
-	handleUpdatedPlayerNote,
 	handleSubscribeModChat,
 	handleModPeekVotes,
 	handleGameFreeze,
 	handleHasSeenNewPlayerModal,
 	handleFlappyEvent,
-	handleUpdatedTheme
 } = require('./user-events');
 const {
 	sendPlayerNotes,
@@ -50,7 +48,7 @@ const {
 	selectOnePolicy,
 	selectBurnCard
 } = require('./game/policy-powers');
-const { games, userInfo, emoteList, findIPBan } = require('./models');
+const { games, userInfo, emoteList, isStandardAEM, findIPBan } = require('./models');
 const Account = require('../../models/account');
 const { TOU_CHANGES } = require('../../src/frontend-scripts/node-constants.js');
 const version = require('../../version');
@@ -76,12 +74,31 @@ const gamesGarbageCollector = async () => {
 	sendGameList();
 };
 
-const isAuthenticated = socket => {
-	if (socket.handshake && socket.handshake.session) {
-		const { passport } = socket.handshake.session;
-
-		return Boolean(passport && passport.user && Object.keys(passport).length);
+const attemptAuthenticate = socket => {
+	let user;
+	try {
+		user = socket.handshake.session.passport.user;
+	} catch {
+		user = null;
 	}
+	return user;
+};
+
+/**
+ * Returns true if userKey is seated in gameKey; False otherwise.
+ *
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @return {Promise<boolean>}
+ */
+const isCurrentGame = async (userKey, gameKey) => {
+	if (userKey != null) {
+		const seatedGameKey = await userInfo.get(userKey, 'currentGame');
+		if (seatedGameKey != null) {
+			return Boolean(seatedGameKey === gameKey);
+		}
+	}
+	return false;
 };
 
 const logOutUser = async (socket, userKey) => {
@@ -106,7 +123,7 @@ const firstVerNew = (v1, v2) => {
 	return true;
 };
 
-const checkRestriction = (socket, account) => {
+const checkRestriction = async (socket, userKey, account) => {
 	if (account.touLastAgreed && account.touLastAgreed.length) {
 		const changesSince = [];
 		const myVer = parseVer(account.touLastAgreed);
@@ -115,21 +132,21 @@ const checkRestriction = (socket, account) => {
 		});
 		if (changesSince.length) {
 			socket.emit('touChange', changesSince);
-			return true;
+			await groups.add('restricted', userKey);
 		}
 	} else {
 		socket.emit('touChange', [TOU_CHANGES[TOU_CHANGES.length - 1]]);
-		return true;
+		await groups.add('restricted', userKey);
 	}
 	const warnings = account.warnings.filter(warning => !warning.acknowledged);
 	if (warnings.length > 0) {
 		const { moderator, acknowledged, ...firstWarning } = warnings[0]; // eslint-disable-line no-unused-vars
 		socket.emit('warningPopup', firstWarning);
-		return true;
+		await groups.add('restricted', userKey);
 	}
 	// implement other restrictions as needed
 	socket.emit('removeAllPopups');
-	return false;
+	await groups.remove('restricted', userKey);
 };
 
 module.exports.socketRoutes = () => {
@@ -142,13 +159,12 @@ module.exports.socketRoutes = () => {
 
 		socket.emit('version', { current: version });
 
-		let isAEM = false;
-
 		/* validate games whenever a packet contains a gameKey */
 		socket.use(async (packet, next) => {
 			const data = packet[1];
-			const gameKey = data && data.uid;
+			const gameKey = data && 'uid' in data;
 
+			/* either send no gameKey or send one for an active game */
 			if (!gameKey || await games.isActive(gameKey)) {
 				return next();
 			} else {
@@ -156,14 +172,11 @@ module.exports.socketRoutes = () => {
 			}
 		});
 
-		/* all sessions start with restricted permissions */
-		let isRestricted = true;
-
-		const authenticated = isAuthenticated(socket);
+		/* see if this session is authenciated as a user */
+		const userKey = attemptAuthenticate(socket);
 
 		/* If this socket is logged in as a user */
-		if (authenticated) {
-			const userKey = passport.user;
+		if (userKey != null) {
 			const account = await Account.findOne({ username: passport.user });
 			const { sockets } = io.sockets;
 			/* Try to find an old socket with the same user */
@@ -203,16 +216,11 @@ module.exports.socketRoutes = () => {
 			}
 
 			/* elevate permissions of compliant authenticated users */
-			isRestricted = checkRestriction(socket, account);
-
-			isAEM = await groups.authorize(userKey, {
-				any: ['admin', 'editor', 'moderator'],
-				none: ['trialmod', 'altmod', 'veteran']
-			});
+			await checkRestriction(socket, userKey, account);
 		}
 
-		sendGeneralChats(socket);
-		sendGameList(socket, isAEM);
+		await sendGeneralChats(socket);
+		await sendGameList(socket, userKey);
 
 		/* Routing */
 
@@ -221,18 +229,19 @@ module.exports.socketRoutes = () => {
 			socket.emit('emoteList', emoteList);
 		});
 
-		socket.on('receiveRestrictions', () => {
-			Account.findOne({ username: passport.user }).then(account => {
-				isRestricted = checkRestriction(account);
-			});
+		socket.on('receiveRestrictions', async () => {
+			if (userKey != null) {
+				const account = await Account.findOne({ username: userKey });
+				await checkRestriction(socket, userKey, account);
+			}
 		});
 
-		socket.on('seeWarnings', username => {
-			if (isAEM) {
-				Account.findOne({ username: username }).then(account => {
+		socket.on('seeWarnings', async targetUser => {
+			if (await isStandardAEM(userKey)) {
+				await Account.findOne({ username: targetUser }).then(account => {
 					if (account) {
 						if (account.warnings && account.warnings.length > 0) {
-							socket.emit('sendWarnings', { username, warnings: account.warnings });
+							socket.emit('sendWarnings', { username: targetUser, warnings: account.warnings });
 						} else {
 							socket.emit('sendAlert', `That user doesn't have any warnings.`);
 						}
@@ -242,7 +251,7 @@ module.exports.socketRoutes = () => {
 				});
 			} else {
 				socket.emit('sendAlert', `Are you sure you're supposed to be doing that?`);
-				console.log(passport.user, 'tried to receive warnings for', username);
+				console.log(userKey, 'tried to receive warnings for', targetUser);
 			}
 		});
 
@@ -251,103 +260,122 @@ module.exports.socketRoutes = () => {
 			await handleSocketDisconnect(socket);
 		});
 
-		socket.on('sendUser', user => {
-			sendSpecificUserList(socket, user.staffRole);
+		socket.on('sendUser', async () => {
+			sendSpecificUserList(socket, userKey);
 		});
 
-		socket.on('flappyEvent', data => {
-			if (isRestricted) return;
-			const game = findGame(data);
-			if (authenticated && ensureInGame(passport, game)) {
-				handleFlappyEvent(data, game);
+		socket.on('flappyEvent', async data => {
+			if (
+				userKey != null
+				&& 'uid' in data
+				&& await groups.authorize(userKey, {none: ['restricted']})
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				await handleFlappyEvent(data);
 			}
 		});
 
 		socket.on('hasSeenNewPlayerModal', () => {
-			if (authenticated) {
+			if (userKey != null) {
 				handleHasSeenNewPlayerModal(socket);
 			}
 		});
 
 		socket.on('getSignups', () => {
-			if (authenticated && isAEM) {
+			if (userKey != null && isStandardAEM(userKey)) {
 				sendSignups(socket);
 			}
 		});
 
 		socket.on('getAllSignups', () => {
-			if (authenticated && isAEM) {
+			if (userKey != null && isStandardAEM(userKey)) {
 				sendAllSignups(socket);
 			}
 		});
 
 		socket.on('getPrivateSignups', () => {
-			if (authenticated && isAEM) {
+			if (userKey != null && isStandardAEM(userKey)) {
 				sendPrivateSignups(socket);
 			}
 		});
 
 		socket.on('regatherAEMUsernames', () => {
-			if (authenticated && isAEM) {
-				gatherStaffUsernames();
+			/* stub: removed for redis MVP */
+		});
+
+		socket.on('confirmTOU', async () => {
+			if (
+				userKey != null
+				&& await groups.authorize(userKey, {none: ['restricted']})
+			) {
+				account = await Account.findOne({ username: userKey });
+				account.touLastAgreed = TOU_CHANGES[0].changeVer;
+				account.save();
+				await checkRestriction(socket, userKey, account);
 			}
 		});
 
-		socket.on('confirmTOU', () => {
-			if (authenticated && isRestricted) {
-				Account.findOne({ username: passport.user }).then(account => {
-					account.touLastAgreed = TOU_CHANGES[0].changeVer;
-					account.save();
-					isRestricted = checkRestriction(account);
-				});
-			}
-		});
-
-		socket.on('acknowledgeWarning', () => {
-			if (authenticated && isRestricted) {
-				Account.findOne({ username: passport.user }).then(acc => {
+		socket.on('acknowledgeWarning', async () => {
+			if (
+				userKey != null
+				&& await groups.authorize(userKey, {all: ['restricted']})
+			) {
+				Account.findOne({ username: userKey }).then(acc => {
 					acc.warnings[acc.warnings.findIndex(warning => !warning.acknowledged)].acknowledged = true;
 					acc.markModified('warnings');
-					acc.save(() => (isRestricted = checkRestriction(acc)));
+					acc.save(() => checkRestriction(acc));
 				});
 			}
-		});
-
-		socket.on('handleUpdatedPlayerNote', data => {
-			handleUpdatedPlayerNote(socket, passport, data);
 		});
 
 		socket.on('handleUpdatedTheme', data => {
-			handleUpdatedTheme(socket, passport, data);
+			/* removed for security concerns */
 		});
 
-		socket.on('updateModAction', data => {
-			if (authenticated && isAEM) {
-				handleModerationAction(socket, passport, data, false, modUserNames, editorUserNames.concat(adminUserNames));
+		socket.on('updateModAction', async data => {
+			if (userKey != null && await isStandardAEM(userKey)) {
+				await handleModerationAction(socket, passport, data, false);
 			}
 		});
-		socket.on('addNewClaim', data => {
-			const game = findGame(data);
-			if (authenticated && ensureInGame(passport, game)) {
-				handleAddNewClaim(socket, passport, game, data);
+
+		socket.on('addNewClaim', async data => {
+			if (
+				userKey != null
+				&& 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				const release = await games.acquire(gameKey);
+				await handleAddNewClaim(socket, userKey, data.uid, data).then(release);
 			}
 		});
-		socket.on('updateGameWhitelist', data => {
-			const game = findGame(data);
-			if (authenticated && ensureInGame(passport, game)) {
-				handleUpdateWhitelist(passport, game, data);
+
+		socket.on('updateGameWhitelist', async data => {
+			if (
+				userKey != null
+				&& 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				const release = await games.acquire(gameKey);
+				await handleUpdateWhitelist(userKey, data.uid, data).then(release);
 			}
 		});
+
 		socket.on('updateTruncateGame', data => {
 			handleUpdatedTruncateGame(data);
 		});
-		socket.on('addNewGameChat', data => {
-			const game = findGame(data);
-			if (isRestricted) return;
-			if (authenticated) {
-				handleAddNewGameChat(socket, passport, data, game, modUserNames, editorUserNames, adminUserNames, handleAddNewClaim);
+
+		socket.on('addNewGameChat', async data => {
+			if (
+				userKey != null
+				&& 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+				&& await groups.authorize(userKey, {none: ['restricted']})
+			) {
+				const release = await games.acquire(gameKey);
+				await handleAddNewGameChat(socket, userKey, data.uid, data).then(release);
 			}
 		});
+
 		socket.on('updateReportGame', data => {
 			try {
 				handleUpdatedReportGame(socket, data);
@@ -355,84 +383,125 @@ module.exports.socketRoutes = () => {
 				console.log(e, 'err in player report');
 			}
 		});
-		socket.on('addNewGame', data => {
-			if (isRestricted) return;
-			if (authenticated) {
-				handleAddNewGame(socket, passport, data);
+
+		socket.on('addNewGame', async data => {
+			if (
+				userKey != null
+				&& await groups.authorize(userKey, {none: ['restricted']})
+			) {
+				await handleAddNewGame(socket, userKey, data);
 			}
 		});
+
 		socket.on('updateGameSettings', data => {
-			if (authenticated) {
+			if (userKey != null) {
 				handleUpdatedGameSettings(socket, passport, data);
 			}
 		});
 
-		socket.on('addNewGeneralChat', data => {
-			if (isRestricted) return;
-			if (authenticated) {
-				handleNewGeneralChat(socket, passport, data, modUserNames, editorUserNames, adminUserNames);
+		socket.on('addNewGeneralChat', async data => {
+			if (
+				userKey != null
+				&& data != null
+				&& 'chat' in data
+				&& await groups.authorize(userKey, {none: ['restricted']})
+			) {
+				await handleNewGeneralChat(socket, userKey, data);
 			}
 		});
-		socket.on('leaveGame', data => {
-			const release = games.acquire(data.uid);
-			const game = games.get(data.uid);
 
+		socket.on('leaveGame', async data => {
 			socket.leave(data.uid);
+			if (
+				userKey != null
+			  && 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				const release = await games.acquire(data.uid);
+				await handleUserLeaveGame(socket, userKey, data.uid, data).then(release);
+			}
+		});
 
-			if (authenticated && game && users.isInGame(passport.user, data.uid)) {
-				handleUserLeaveGame(socket, game, data, passport);
+		socket.on('updateSeatedUser', async data => {
+			if (
+				userKey != null
+				&& await isCurrentGame(userKey, data.uid)
+				&& await groups.authorize(userKey, {none: ['restricted']})
+			) {
+				const release = await games.acquire(data.uid);
+				await updateSeatedUser(socket, userKey, data.uid).then(release);
 			}
+		});
 
-			release();
-		});
-		socket.on('updateSeatedUser', data => {
-			if (isRestricted) return;
-			if (authenticated) {
-				updateSeatedUser(socket, passport, data);
+		socket.on('playerReport', async data => {
+			if (
+				userKey != null
+				&& data != null
+				&& 'comment' in data
+				&& typeof data.comment == 'string'
+				&& data.comment.length > 140
+				&& 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				await handlePlayerReport(userKey, data.uid, data);
 			}
 		});
-		socket.on('playerReport', data => {
-			if (isRestricted || !data || !data.comment || data.comment.length > 140) return;
-			if (authenticated) {
-				handlePlayerReport(passport, data);
-			}
-		});
-		socket.on('playerReportDismiss', () => {
-			if (authenticated && isAEM) {
+
+		socket.on('playerReportDismiss', async () => {
+			if (
+				userKey != null
+				&& await isStandardAEM(userKey)
+			) {
 				handlePlayerReportDismiss();
 			}
 		});
-		socket.on('updateRemake', data => {
-			const game = findGame(data);
-			if (authenticated && ensureInGame(passport, game)) {
-				handleUpdatedRemakeGame(passport, game, data, socket);
+
+		socket.on('updateRemake', async data => {
+
+			if (
+				userKey != null
+				&& 'uid' in data
+				&& await isCurrentGame(userKey, data.uid)
+			) {
+				const release = await games.acquire(gameKey);
+				await handleUpdatedRemakeGame(socket, userKey, gameKey, data).then(release);
 			}
 		});
+
 		socket.on('updateBio', data => {
-			if (authenticated) {
-				handleUpdatedBio(socket, passport, data);
+			if (
+				userKey != null
+			) {
+				handleUpdatedBio(socket, userKey, data);
 			}
 		});
+
 		// user-requests
 
 		socket.on('getPlayerNotes', data => {
-			sendPlayerNotes(socket, data);
+			/* removed for redis mvp */
 		});
+
 		socket.on('getGameList', () => {
 			sendGameList(socket);
 		});
+
 		socket.on('getGameInfo', uid => {
 			sendGameInfo(socket, uid);
 		});
+
 		socket.on('getUserList', () => {
 			sendUserList(socket);
 		});
+
 		socket.on('getGeneralChats', () => {
 			sendGeneralChats(socket);
 		});
+
 		socket.on('getUserGameSettings', () => {
 			sendUserGameSettings(socket);
 		});
+
 		socket.on('selectedChancellorVoteOnVeto', data => {
 			if (isRestricted) return;
 			const game = findGame(data);
@@ -440,11 +509,13 @@ module.exports.socketRoutes = () => {
 				selectChancellorVoteOnVeto(passport, game, data);
 			}
 		});
+
 		socket.on('getModInfo', count => {
 			if (authenticated && (isAEM || isTrial)) {
 				sendModInfo(games, socket, count, isTrial && !isAEM);
 			}
 		});
+
 		socket.on('subscribeModChat', uid => {
 			if (authenticated && isAEM) {
 				const game = findGame({ uid });
@@ -465,6 +536,7 @@ module.exports.socketRoutes = () => {
 				} else socket.emit('sendAlert', 'Game is missing.');
 			}
 		});
+
 		socket.on('modPeekVotes', data => {
 			const uid = data.uid;
 			if (authenticated && isAEM) {
@@ -476,6 +548,7 @@ module.exports.socketRoutes = () => {
 				socket.emit('sendAlert', 'Game is missing.');
 			}
 		});
+
 		socket.on('modFreezeGame', data => {
 			const uid = data.uid;
 			if (authenticated && isAEM) {
@@ -487,22 +560,25 @@ module.exports.socketRoutes = () => {
 				socket.emit('sendAlert', 'Game is missing.');
 			}
 		});
+
 		socket.on('getUserReports', () => {
 			if (authenticated && (isAEM || isTrial)) {
 				sendUserReports(socket);
 			}
 		});
-		socket.on('updateUserStatus', (type, gameId) => {
-			const game = findGame({ uid: gameId });
-			if (authenticated && ensureInGame(passport, game)) {
-				updateUserStatus(passport, game);
-			} else if (authenticated) {
-				updateUserStatus(passport);
+
+		socket.on('updateUserStatus', async (type, gameId) => {
+			if (userKey !== null && isCurrentGame(userKey, gameId)) {
+				await updateUserStatus(userKey, game);
+			} else if (userKey !== null ) {
+				await updateUserStatus(userKey);
 			}
 		});
+
 		socket.on('getReplayGameChats', uid => {
 			sendReplayGameChats(socket, uid);
 		});
+
 		// election
 
 		socket.on('presidentSelectedChancellor', data => {

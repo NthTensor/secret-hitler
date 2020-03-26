@@ -290,7 +290,7 @@ module.exports.groups = {
 	/**
 	 * List all members of a group.
 	 *
-	 * @param {string[]} groupKey - A group cache key
+	 * @param {string} groupKey - A group cache key
 	 * @return {Promise<string[]>}
 	 */
 	async members(groupKey) {
@@ -367,14 +367,24 @@ module.exports.userInfo = {
 	 * @example
 	 *
 	 *     	userInfo.set('key', 'prop', 'value);
-	 *      userInfo.set('key', {prop1: 'value1', prop2: 'value2'});
+	 *      userInfo.set('key', {prop1: 'one', prop2: 2});
 	 */
 	async set(userKey, info, value) {
-		if (typeof info === 'string') {
-			await redis.hset(`user+info:${userKey}`, info, value);
+		let peroperties = {};
+
+		if (typeof info == 'string') {
+			peroperties[info] = value;
 		} else {
-			await redis.hset(`user+info:${userKey}`, info);
+			peroperties = info;
 		}
+
+		for (const property in peroperties) {
+			if (peroperties.hasOwnProperty(property)) {
+				peroperties[property] = JSON.stringify(peroperties[property])
+			}
+		}
+
+		await redis.hset(`user+info:${userKey}`, peroperties);
 	},
 
 	/**
@@ -382,7 +392,7 @@ module.exports.userInfo = {
 	 *
 	 * @param {string} userKey - A user cache key
 	 * @param {string|string[]} [info] - Optional list of parameters to fetch
-	 * @return {Promise<*>}
+	 * @return {Promise<object>}
 	 *
 	 * @example
 	 *
@@ -391,14 +401,35 @@ module.exports.userInfo = {
 	 *      userInfo.get('key', ['prop1', 'prop2']);
 	 */
 	async get(userKey, info) {
+		let peroperties;
 		if (typeof info !== 'undefined') {
-			return redis.hgetall(`user+info:${userKey}`);
+			peroperties = await redis.hgetall(`user+info:${userKey}`)
 		} else {
-			return redis.hget(`user+info:${userKey}`, info);
+			peroperties = await redis.hget(`user+info:${userKey}`, info);
 		}
-	}
 
+		for (const property in peroperties) {
+			if (peroperties.hasOwnProperty(property)) {
+				peroperties[property] = JSON.parse(peroperties[property])
+			}
+		}
+
+		return peroperties;
+	},
+
+	/**
+	 * Deletes a user property.
+	 *
+	 * @param {string} userKey - A user cache key
+	 * @param {string} prop - A user info property
+	 * @return {Promise<void>}
+	 */
+	async delete(userKey, prop) {
+		await redis.hdel(`user+info:${userKey}`, prop);
+	}
 };
+
+const serverStateDate = new Date();
 
 /**
  * General chat model.
@@ -417,12 +448,14 @@ module.exports.genChat = {
 				.pipeline()
 				.rpush(`gen+chat`, chats.map(chat => JSON.stringify(chat)))
 				.ltrim(`gen+chat`, -99, -1)
+				.set(`gen+chat+time`, new Date().toJSON())
 				.exec();
 		} else {
 			await redis
 				.pipeline()
 				.rpush(`gen+chat`, JSON.stringify(chats))
 				.ltrim(`gen+chat`, -99, -1)
+				.set(`gen+chat+time`, new Date().toJSON())
 				.exec();
 		}
 	},
@@ -437,12 +470,46 @@ module.exports.genChat = {
 	},
 
 	/**
-	 * Retrieves all gen-chat
+	 * Retrieves all gen-chat.
+	 * Note: Returns a formatted json string, ready for sending to clients.
 	 *
-	 * @return {Promise<Object[]>}
+	 * @return {Promise<string>}
 	 */
 	async get() {
-		return redis.get(`gen+chat`).then(chats => chats.map(JSON.parse));
+		return redis
+			.multi()
+			.get(`sticky`)
+			.get(`gen+chat`)
+			.exec()
+			.then(results => {
+				return `{"sticky":"${results[0][1] || ""}","list":[${results[1][1].join(',')}]}`
+			});
+	},
+
+	/**
+	 * Sets chat sticky.
+	 *
+	 * @param {string} msg - A message to sticky
+	 * @return {Promise<void>}
+	 */
+	async stick(msg) {
+		await redis.set('sticky', msg);
+	},
+
+	/**
+	 * Returns the time since the last chat message was posted.
+	 * If there is no previous message, returns time since start.
+	 *
+	 * @return {Promise<Date>}
+	 */
+	async timeSinceLast() {
+		const curTime = new Date();
+		const jsonDate = await redis.get(`gen+chat+time`);
+		if (jsonDate != null) {
+			return curTime - new Date(jsonDate);
+		} else {
+			return curTime - serverStateDate;
+		}
 	}
 };
 
@@ -484,6 +551,20 @@ module.exports.options = {
 	}
 };
 
+
+/**
+ * Standard AEM group lookup
+ *
+ * @param {string} userKey - A user cache key
+ * @return {Promise<boolean>}
+ */
+module.exports.isStandardAEM = async userKey => {
+	return await module.exports.groups.authorize(userKey, {
+		any: ['admin', 'editor', 'moderator'],
+		none: ['trialmod', 'altmod', 'veteran']
+	});
+};
+
 // set of profiles, no duplicate usernames
 /**
  * @return // todo
@@ -507,43 +588,46 @@ module.exports.profiles = (() => {
 	return { get, push };
 })();
 
-module.exports.formattedUserList = isAEM => {
+module.exports.formattedUserList = async userKey => {
 	const prune = value => {
 		// Converts things like zero and null to undefined to remove it from the sent data.
 		return value ? value : undefined;
 	};
 
-	return module.exports.userList
-		.map(user => ({
-			userName: user.userName,
-			wins: prune(user.wins),
-			losses: prune(user.losses),
-			rainbowWins: prune(user.rainbowWins),
-			rainbowLosses: prune(user.rainbowLosses),
-			isPrivate: prune(user.isPrivate),
-			staffDisableVisibleElo: prune(user.staffDisableVisibleElo),
-			staffDisableStaffColor: prune(user.staffDisableStaffColor),
+	const isAEM = await isStandardAEM(userKey);
+	const onlineKeys = await module.exports.groups.members('online');
+	const onlineUsers = onlineKeys.map(async onlineKey => await module.exports.userInfo.get(onlineKey));
+	return onlineUsers
+		.map(userInfo => ({
+			userName: userInfo.userName,
+			wins: prune(userInfo.wins),
+			losses: prune(userInfo.losses),
+			rainbowWins: prune(userInfo.rainbowWins),
+			rainbowLosses: prune(userInfo.rainbowLosses),
+			isPrivate: prune(userInfo.isPrivate),
+			staffDisableVisibleElo: prune(userInfo.staffDisableVisibleElo),
+			staffDisableStaffColor: prune(userInfo.staffDisableStaffColor),
 
 			// Tournaments are disabled, no point sending this.
 			// tournyWins: user.tournyWins,
 
 			// Blacklists are sent in the sendUserGameSettings event.
 			// blacklist: user.blacklist,
-			customCardback: user.customCardback,
-			customCardbackUid: user.customCardbackUid,
-			eloOverall: user.eloOverall ? Math.floor(user.eloOverall) : undefined,
-			eloSeason: user.eloSeason ? Math.floor(user.eloSeason) : undefined,
-			status: user.status && user.status.type && user.status.type != 'none' ? user.status : undefined,
-			winsSeason: prune(user[`winsSeason${CURRENTSEASONNUMBER}`]),
-			lossesSeason: prune(user[`lossesSeason${CURRENTSEASONNUMBER}`]),
-			rainbowWinsSeason: prune(user[`rainbowWinsSeason${CURRENTSEASONNUMBER}`]),
-			rainbowLossesSeason: prune(user[`rainbowLossesSeason${CURRENTSEASONNUMBER}`]),
-			previousSeasonAward: user.previousSeasonAward,
-			specialTournamentStatus: user.specialTournamentStatus,
-			timeLastGameCreated: user.timeLastGameCreated,
-			staffRole: prune(user.staffRole),
-			staffIncognito: prune(user.staffIncognito),
-			isContributor: prune(user.isContributor)
+			status: 'status' in userInfo ? userInfo.status : undefined,
+			customCardback: userInfo.customCardback,
+			customCardbackUid: userInfo.customCardbackUid,
+			eloOverall: userInfo.eloOverall ? Math.floor(userInfo.eloOverall) : undefined,
+			eloSeason: userInfo.eloSeason ? Math.floor(userInfo.eloSeason) : undefined,
+			winsSeason: prune(userInfo[`winsSeason${CURRENTSEASONNUMBER}`]),
+			lossesSeason: prune(userInfo[`lossesSeason${CURRENTSEASONNUMBER}`]),
+			rainbowWinsSeason: prune(userInfo[`rainbowWinsSeason${CURRENTSEASONNUMBER}`]),
+			rainbowLossesSeason: prune(userInfo[`rainbowLossesSeason${CURRENTSEASONNUMBER}`]),
+			previousSeasonAward: userInfo.previousSeasonAward,
+			specialTournamentStatus: userInfo.specialTournamentStatus,
+			timeLastGameCreated: userInfo.timeLastGameCreated,
+			staffRole: prune(userInfo.staffRole),
+			staffIncognito: prune(userInfo.staffIncognito),
+			isContributor: prune(userInfo.isContributor)
 			// oldData: user
 		}))
 		.filter(user => isAEM || !user.staffIncognito);
@@ -571,10 +655,8 @@ const userListEmitter = {
 module.exports.userListEmitter = userListEmitter;
 
 module.exports.formattedGameList = async () => {
-	const keys = await games.keys();
-	return keys.map(key => {
-		const game = games.get(key);
-		return {
+	const allGames = await games.keys().then(keys => games.get(keys));
+	return allGames.map(game => ({
 			name: game.general.name,
 			flag: game.general.flag,
 			userNames: game.publicPlayersState.map(val => val.userName),
@@ -623,8 +705,7 @@ module.exports.formattedGameList = async () => {
 			rainbowgame: game.general.rainbowgame || undefined,
 			isCustomGame: game.customGameSettings.enabled,
 			isUnlisted: game.general.unlisted || undefined
-		};
-	});
+	}));
 };
 
 const gameListEmitter = {

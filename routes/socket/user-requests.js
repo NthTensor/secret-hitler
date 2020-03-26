@@ -1,18 +1,14 @@
 const Account = require('../../models/account');
 const ModAction = require('../../models/modAction');
 const PlayerReport = require('../../models/playerReport');
-const PlayerNote = require('../../models/playerNote');
 const Game = require('../../models/game');
 const Signups = require('../../models/signups');
 
 const {
 	games,
 	userList,
-	generalChats,
-	accountCreationDisabled,
-	ipbansNotEnforced,
-	gameCreationDisabled,
-	limitNewPlayers,
+	genChat,
+	isStandardAEM,
 	userListEmitter,
 	formattedUserList,
 	gameListEmitter,
@@ -27,7 +23,7 @@ const { CURRENTSEASONNUMBER } = require('../../src/frontend-scripts/node-constan
 /**
  * @param {object} socket - user socket reference.
  */
-const sendUserList = (module.exports.sendUserList = socket => {
+module.exports.sendUserList = socket => {
 	// eslint-disable-line one-var
 	if (socket) {
 		socket.emit('fetchUser');
@@ -37,17 +33,15 @@ const sendUserList = (module.exports.sendUserList = socket => {
 	} else {
 		userListEmitter.send = true;
 	}
-});
+};
 
-module.exports.sendSpecificUserList = (socket, staffRole) => {
+module.exports.sendSpecificUserList = (socket, userKey) => {
 	// eslint-disable-line one-var
-	const isAEM = Boolean(staffRole && staffRole !== 'altmod' && staffRole !== 'veteran');
-	if (socket) {
+
+	if (socket != null) {
 		socket.emit('userList', {
-			list: formattedUserList(isAEM)
+			list: formattedUserList(userKey)
 		});
-	} else {
-		console.log('no socket received!');
 	}
 };
 
@@ -240,22 +234,6 @@ module.exports.sendUserGameSettings = socket => {
 
 /**
  * @param {object} socket - user socket reference.
- * @param {object} data - data about the request
- */
-module.exports.sendPlayerNotes = (socket, data) => {
-	PlayerNote.find({ userName: data.userName, notedUser: { $in: data.seatedPlayers } })
-		.then(notes => {
-			if (notes) {
-				socket.emit('notesUpdate', notes);
-			}
-		})
-		.catch(err => {
-			console.log(err, 'err in getting playernotes');
-		});
-};
-
-/**
- * @param {object} socket - user socket reference.
  * @param {string} uid - uid of game.
  */
 module.exports.sendReplayGameChats = (socket, uid) => {
@@ -271,14 +249,15 @@ module.exports.sendReplayGameChats = (socket, uid) => {
 };
 
 /**
- * @param {object} socket - user socket reference.
- * @param {boolean} isAEM - user AEM designation
+ * @param {object} socket - User socket reference
+ * @param {string} userKey - A user cache key
  */
-module.exports.sendGameList = (socket, isAEM) => {
+module.exports.sendGameList = async (socket, userKey) => {
+	const canSeeUnlisted = await isStandardAEM(userKey);
 	// eslint-disable-line one-var
-	if (socket) {
-		let gameList = formattedGameList();
-		gameList = gameList.filter(game => isAEM || (game && !game.isUnlisted));
+	if (socket != null) {
+		let gameList = await formattedGameList();
+		gameList = gameList.filter(game => canSeeUnlisted || (game && !game.isUnlisted));
 		socket.emit('gameList', gameList);
 	} else {
 		gameListEmitter.send = true;
@@ -300,19 +279,22 @@ module.exports.sendUserReports = socket => {
 /**
  * @param {object} socket - user socket reference.
  */
-module.exports.sendGeneralChats = socket => {
-	socket.emit('generalChats', generalChats);
+module.exports.sendGeneralChats = async socket => {
+	await genChat.get().then(genChat => {
+		socket.emit('generalChats', genChat);
+	});
 };
 
 /**
- * @param {object} passport - socket authentication.
- * @param {object} game - target game.
- * @param {string} override - type of user status to be displayed.
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @param {string} override - Type of user status to be displayed.
  */
-const updateUserStatus = (module.exports.updateUserStatus = (passport, game, override) => {
-	const user = userList.find(user => user.userName === passport.user);
-	if (user) {
-		user.status = {
+const updateUserStatus = async (userKey, gameKey, override) => {
+	const release = await userInfo.acquire(userKey);
+	if (gameKey != null) {
+		const game = await games.get(gameKey);
+		await userInfo.set(userKey, 'status', {
 			type:
 				override && game && !game.general.unlisted
 					? override
@@ -320,48 +302,66 @@ const updateUserStatus = (module.exports.updateUserStatus = (passport, game, ove
 					? game.general.private
 						? 'private'
 						: !game.general.unlisted && game.general.rainbowgame
-						? 'rainbow'
-						: !game.general.unlisted
-						? 'playing'
-						: 'none'
+							? 'rainbow'
+							: !game.general.unlisted
+								? 'playing'
+								: 'none'
 					: 'none',
 			gameId: game ? game.general.uid : false
-		};
-		sendUserList();
+		}).then(release);
+	} else {
+		await userInfo.delete(userKey, 'status').then(release);
 	}
-});
+	sendUserList();
+};
 
-/**
+module.exports.updateUserStatus = updateUserStatus;
+
+	/**
  * @param {object} socket - A user socket reference
  * @param {string} gameKey - A game cache key
  * @param {string} [userKey] - An optional user cache key
  */
 module.exports.sendGameInfo = async (socket, gameKey, userKey) => {
 
+	let game;
 	if (userKey != null) {
-		const release = await games.acquire(gameKey);
-		const game = await games.get(gameKey);
-		if (game == null) {
-			release();
+
+		const releaseUser = await userInfo.acquire(userKey);
+		const currentGame = await userInfo.get(userKey, 'currentGame');
+
+		/* Do not allow a user to join more than one game */
+		if (currentGame != null) {
+			releaseUser();
+			return
+		} else {
+			await userInfo.set(userKey, 'currentGame').then(releaseUser);
+		}
+
+		const releaseGame = await games.acquire(gameKey);
+		game = await games.get(gameKey);
+		if (game != null) {
+			const player = game.publicPlayersState.find(player => player.userName === userKey);
+
+			if (player) {
+				player.leftGame = false;
+				player.connected = true;
+				socket.emit('updateSeatForUser', true);
+				await updateUserStatus(userKey, gameKey);
+			} else {
+				await updateUserStatus(userKey, gameKey, 'observing');
+			}
+		} else {
+			releaseGame();
 			const game = await Game.findOne({ uid: gameKey });
-			socket.emit('manualReplayRequest', game ? game.uid : '');
+			socket.emit('manualReplayRequest', game ? gameKey : '');
 			return;
 		}
 
-		const player = game.publicPlayersState.find(player => player.userName === userKey);
+		await games.set(gameKey, game).then(releaseGame);
 
-		if (player) {
-			player.leftGame = false;
-			player.connected = true;
-			socket.emit('updateSeatForUser', true);
-			updateUserStatus(passport, game);
-		} else {
-			updateUserStatus(passport, game, 'observing');
-		}
-
-		release();
 	} else {
-		const game = await games.get(gameKey);
+		game = await games.get(gameKey);
 	}
 
 	if (game !== null) {
@@ -372,22 +372,22 @@ module.exports.sendGameInfo = async (socket, gameKey, userKey) => {
 				player.leftGame = false;
 				player.connected = true;
 				socket.emit('updateSeatForUser', true);
-				updateUserStatus(passport, game);
+				updateUserStatus(userKey, gameKey);
 			} else {
-				updateUserStatus(passport, game, 'observing');
+				updateUserStatus(userKey, gameKey, 'observing');
 			}
 		}
 
-		socket.join(uid);
+		socket.join(gameKey);
 		sendInProgressGameUpdate(game);
 		socket.emit('joinGameRedirect', game.general.uid);
 	} else {
-		Game.findOne({ uid }).then((game, err) => {
+		Game.findOne({ uid: gameKey }).then((game, err) => {
 			if (err) {
 				console.log(err, 'game err retrieving for replay');
 			}
 
-			socket.emit('manualReplayRequest', game ? game.uid : '');
+			socket.emit('manualReplayRequest', game ? gameKey : '');
 		});
 	}
 };
