@@ -42,7 +42,7 @@ module.exports.ProcessImage = (username, raw, callback) => {
 						if (foundUser) {
 							foundUser.customCardback = '';
 							io.sockets.in(uid).emit('gameUpdate', secureGame(game));
-							sendGameList();
+							;
 						}
 					});
 					const socketId = Object.keys(io.sockets.sockets).find(

@@ -1,108 +1,83 @@
 const { sendInProgressGameUpdate } = require('../util');
-const { sendGameList } = require('../user-requests');
-const { selectChancellor } = require('./election-util');
 const _ = require('lodash');
+const { groups, games } = require('../models');
 
-/**
- * @param {object} game - game to act on.
- * @param {boolean} isStart - true if this is the initial shuffle.
- */
-const shufflePolicies = (module.exports.shufflePolicies = (game, isStart) => {
-	if (!game) {
-		return;
-	}
-
-	if (isStart) {
-		game.trackState.enactedPolicies = [];
-		if (game.customGameSettings.trackState.lib > 0) {
-			game.trackState.liberalPolicyCount = game.customGameSettings.trackState.lib;
-			_.range(0, game.customGameSettings.trackState.lib).forEach(num => {
-				game.trackState.enactedPolicies.push({
-					cardBack: 'liberal',
-					isFlipped: true,
-					position: `liberal${num + 1}`
-				});
-			});
-		}
-		if (game.customGameSettings.trackState.fas > 0) {
-			game.trackState.fascistPolicyCount = game.customGameSettings.trackState.fas;
-			_.range(0, game.customGameSettings.trackState.fas).forEach(num => {
-				game.trackState.enactedPolicies.push({
-					cardBack: 'fascist',
-					isFlipped: true,
-					position: `fascist${num + 1}`
-				});
-			});
-		}
-	}
-
-	const libCount = game.customGameSettings.deckState.lib - game.trackState.liberalPolicyCount;
-	const fasCount = game.customGameSettings.deckState.fas - game.trackState.fascistPolicyCount;
-	game.private.policies = _.shuffle(
-		_.range(0, libCount)
-			.map(num => 'liberal')
-			.concat(_.range(0, fasCount).map(num => 'fascist'))
-	);
-
-	game.gameState.undrawnPolicyCount = game.private.policies.length;
-
-	if (!game.general.disableGamechat) {
-		const chat = {
-			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: 'Deck shuffled: '
-				},
-				{
-					text: `${libCount} liberal`,
-					type: 'liberal'
-				},
-				{
-					text: ' and '
-				},
-				{
-					text: `${fasCount} fascist`,
-					type: 'fascist'
-				},
-				{
-					text: ' policies.'
-				}
-			]
-		};
-		game.private.seatedPlayers.forEach(player => {
-			player.gameChats.push(chat);
-		});
-		game.private.unSeatedGameChats.push(chat);
-	}
-
-	const modOnlyChat = {
-		timestamp: new Date(),
-		gameChat: true,
-		chat: [{ text: 'The deck has been shuffled: ' }]
-	};
-	game.private.policies.forEach(policy => {
-		modOnlyChat.chat.push({
-			text: policy === 'liberal' ? 'B' : 'R',
-			type: policy
-		});
-	});
-	game.private.hiddenInfoChat.push(modOnlyChat);
+const chatPlayer = (userKey, seats, blind) => ({
+	text: blind ? `{${seats.indexOf(userKey) + 1}` : `${userKey} {${seats.indexOf(userKey) + 1}}`,
+	type: 'player'
 });
+module.exports.chatPlayer = chatPlayer;
+
+const chatText = (text) => ({
+	text: text
+});
+module.exports.chatText = chatText;
+
+const chatTeam = (team) => ({
+	text: team === 'liberal' ? 'liberal' : 'fascist',
+	type: team === 'liberal' ? 'liberal' : 'fascist'
+});
+module.exports.chatText = chatText;
+
+module.exports.phaseTransition = async (gameKey, phase) => {
+
+	switch (phase) {
+		/* Transitions into the voting phase */
+		case phases.VOTING:
+			const { electionCount, president, pendingChancellor } = games.getState(gameKey, 'electionCount');
+
+			await games.setState(gameKey, {
+				status: `Vote on election #${electionCount} now.`,
+				phase: phases.VOTING
+			});
+
+			for (const playerKey of await groups.members('players', gameKey)) {
+				await groups.add('loader', playerKey, gameKey);
+				await games.setCard(gameKey, playerKey, {
+					displayed: true,
+					flipped: false,
+					front: 'ballot',
+					back: {}
+				});
+			}
+
+			await games.writeChannel(gameKey, channels.GAME.PLAYER, {
+				timestamp: new Date(),
+				chat: [
+					chatText('You must vote for the election of president '),
+					chatPlayer(president),
+					chatText(' and chancellor '),
+					chatPlayer(pendingChancellor),
+					chatText('.'),
+				]
+			});
+
+			await games.writeChannel(gameKey, channels.GAME.OBSERVER, {
+				timestamp: new Date(),
+				chat: [
+					chatText('President '),
+					chatPlayer(president),
+					chatText(' nominates '),
+					chatPlayer(pendingChancellor),
+					chatText(' as chancellor.'),
+				]
+			});
+
+			break;
+	}
+};
 
 /**
- * @param {object} game - game to act on.
- * @param {number} specialElectionPresidentIndex - number of index of the special election player (optional)
+ * @param {string} gameKey - A game cache key
+ * @param {string} president - A user cache key to be the next president (optional)
  */
-module.exports.startElection = (game, specialElectionPresidentIndex) => {
-	const { experiencedMode } = game.general;
+module.exports.startTurn = async (gameKey, president) => {
 
-	if (game.trackState.fascistPolicyCount >= game.customGameSettings.vetoZone) {
-		game.gameState.isVetoEnabled = true;
-	}
+	const { vetoZone } = await games.getConfig(gameKey, 'vetoZone');
+	const { fascistPlayed } = await games.getState(gameKey, 'fascistPolicyCount');
 
-	if (game.gameState.undrawnPolicyCount < 3) {
-		shufflePolicies(game);
+	if (fascistPlayed >= vetoZone) {
+		await games.setState(gameKey, {isVetoEnabled: true})
 	}
 
 	/**
@@ -142,7 +117,6 @@ module.exports.startElection = (game, specialElectionPresidentIndex) => {
 	const pendingPresidentPlayer = seatedPlayers[presidentIndex];
 
 	game.general.electionCount++;
-	sendGameList();
 	game.general.status = `Election #${game.general.electionCount}: president to select chancellor.`;
 	if (!experiencedMode && !game.general.disableGamechat) {
 		pendingPresidentPlayer.gameChats.push({

@@ -2,21 +2,21 @@ const {
 	games,
 	userInfo,
 	groups,
+	gameSets,
 	options,
 	userListEmitter,
 	createNewBypass,
 	isStandardAEM,
 	genChat,
+	stages,
 } = require('./models');
-const { getModInfo, sendGameList, sendUserList, updateUserStatus, sendGameInfo, sendUserReports, sendGeneralChats } = require('./user-requests');
+const { getModInfo, sendGameList, joinGameLobby, sendUserReports } = require('./user-requests');
 const { selectVoting } = require('./game/election.js');
-const { selectChancellor } = require('./game/election-util.js');
 const Account = require('../../models/account');
 const ModAction = require('../../models/modAction');
 const PlayerReport = require('../../models/playerReport');
 const BannedIP = require('../../models/bannedIP');
 const Profile = require('../../models/profile/index');
-const startGame = require('./game/start-game.js');
 const { completeGame } = require('./game/end-game');
 const { secureGame } = require('./util.js');
 // const crypto = require('crypto');
@@ -34,20 +34,18 @@ const generalChatReplTime = Array(chatReplacements.length + 1).fill(0);
 const interval = require('interval-promise');
 
 /**
- * @param {object} game - game to act on.
- * @return {string} status text.
+ *
+ * @param {number} minPlayersCount
+ * @param {number} maxPlayersCount
+ * @param {number} excludedPlayerCount
+ * @return {string}
  */
-const displayWaitingForPlayers = game => {
-	if (game.general.isTourny) {
-		const count = game.general.maxPlayersCount - game.general.tournyInfo.queuedPlayers.length;
-
-		return count === 1 ? `Waiting for ${count} more player..` : `Waiting for ${count} more players..`;
-	}
-	const includedPlayerCounts = _.range(game.general.minPlayersCount, game.general.maxPlayersCount).filter(
-		value => !game.general.excludedPlayerCount.includes(value)
+const displayWaitingForPlayers = (minPlayersCount, maxPlayersCount, excludedPlayerCount) => {
+	const includedPlayerCounts = _.range(minPlayersCount, maxPlayersCount).filter(
+		value => !excludedPlayerCount.includes(value)
 	);
 
-	for (value of includedPlayerCounts) {
+	for (const value of includedPlayerCounts) {
 		if (value > game.publicPlayersState.length) {
 			const count = value - game.publicPlayersState.length;
 
@@ -57,258 +55,47 @@ const displayWaitingForPlayers = game => {
 };
 
 /**
- * Counts down to game creation, then passes games off to `startGame`
+ * Moves games between the 'pregame' and 'starting' phases.
+ * Note: Games must be started by an external read of the `starting` gameSet.
  *
  * @param {string} gameKey - A game cache key
- * @param {Object} game - A game object
  */
-const startCountdown = async (gameKey, game) => {
+const checkStartConditions = async (gameKey) => {
 
-	if (game.gameState.isStarted) {
-		return;
-	}
+	const release = await games.acquire(gameKey).writeLock();
+	const { stage } = await games.getState(gameKey, 'stage');
+	const { minPlayersCount, maxPlayersCount, excludedPlayerCount } =
+		await games.getConfig(gameKey, 'minPlayersCount', 'excludedPlayerCount', 'maxPlayersCount');
+	const numPlayers = groups.count('players', gameKey);
 
-	game.gameState.isStarted = true;
-	let startGamePause = game.general.isTourny ? 5 : 20;
+	const sufficentPlayers = minPlayersCount < numPlayers || !excludedPlayerCount.includes(numPlayers);
 
-	while (true) {
-		if (game.gameState.cancellStart) {
-			game.gameState.cancellStart = false;
-			game.gameState.isStarted = false;
-			return;
-		} else if (startGamePause === 4 || game.publicPlayersState.length === game.general.maxPlayersCount) {
+	if (stage === stages.SETUP || stage === stages.STARTING) {
 
-			if (game.general.isTourny) {
-				const { queuedPlayers } = game.general.tournyInfo;
-				const players = _.shuffle(queuedPlayers);
-				const gameA = _.cloneDeep(game);
-				const APlayers = players.filter((player, index) => index < game.general.maxPlayersCount / 2);
-				const BPlayers = players.filter(player => !APlayers.includes(player));
-				const APlayerNames = APlayers.map(player => player.userName);
-				const BPlayerNames = BPlayers.map(player => player.userName);
-				const ASocketIds = Object.keys(io.sockets.sockets).filter(
-					socketId =>
-						io.sockets.sockets[socketId].handshake.session.passport && APlayerNames.includes(io.sockets.sockets[socketId].handshake.session.passport.user)
-				);
-				const BSocketIds = Object.keys(io.sockets.sockets).filter(
-					socketId =>
-						io.sockets.sockets[socketId].handshake.session.passport && BPlayerNames.includes(io.sockets.sockets[socketId].handshake.session.passport.user)
-				);
+		if (sufficentPlayers) {
+			/* We do have the right number of players, so game should be marked as ready to start  */
+			await games.setState(gameKey, {
+				stage: stages.STARTING,
+				status: 'Starting game',
+				readyToStartAt: new Date()
+				/* We will use this time to scan through the 'starting' game set and start games that
+         * are old enough. An await timer here might have odd side effects on multiple nodes.
+         */
+			});
 
-				gameA.general.uid = `${gameKey}TableA`;
-				gameA.general.minPlayersCount = gameA.general.maxPlayersCount = game.general.maxPlayersCount / 2;
-				gameA.publicPlayersState = APlayers;
-
-				const gameB = _.cloneDeep(gameA);
-				gameB.general.uid = `${gameKey}TableB`;
-				gameB.publicPlayersState = BPlayers;
-
-				ASocketIds.forEach(id => {
-					const socket = io.sockets.sockets[id];
-
-					Object.keys(socket.rooms).forEach(roomUid => {
-						socket.leave(roomUid);
-					});
-					socket.join(gameA.general.uid);
-					socket.emit('joinGameRedirect', gameA.general.uid);
-				});
-
-				BSocketIds.forEach(id => {
-					const socket = io.sockets.sockets[id];
-
-					Object.keys(socket.rooms).forEach(roomUid => {
-						socket.leave(roomUid);
-					});
-					socket.join(gameB.general.uid);
-					socket.emit('joinGameRedirect', gameB.general.uid);
-				});
-
-				await games.remove(gameKey);
-
-				gameA.general.tournyInfo.round = gameB.general.tournyInfo.round = 1;
-				gameA.general.name = `${gameA.general.name}-tableA`;
-				gameB.general.name = `${gameB.general.name}-tableB`;
-
-				delete gameA.general.tournyInfo.queuedPlayers;
-				delete gameB.general.tournyInfo.queuedPlayers;
-
-				if (game.general.blindMode) {
-					const _shuffledAdjectives = _.shuffle(adjectives);
-
-					gameA.general.replacementNames = _.shuffle(animals)
-						.slice(0, gameA.publicPlayersState.length)
-						.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
-
-					gameB.general.replacementNames = _.shuffle(animals)
-						.slice(0, gameB.publicPlayersState.length)
-						.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
-				}
-
-				const gameKeyA = await games.register(gameA);
-				const gameKeyB = await games.register(gameB);
-
-				startGame(gameKeyA, gameA);
-				startGame(gameKeyB, gameB);
-				sendGameList();
-			} else {
-				if (game.general.blindMode) {
-					const _shuffledAdjectives = _.shuffle(adjectives);
-
-					game.general.replacementNames = _.shuffle(animals)
-						.slice(0, game.publicPlayersState.length)
-						.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
-				}
-
-				games.set(gameKey, game).then(release);
-
-				startGame(gameKey, game);
-			}
-			return;
+			await gameSets.add('starting', gameKey);
 		} else {
-			game.general.status = game.general.isTourny
-				? `Tournament starts in ${startGamePause} second${startGamePause === 1 ? '' : 's'}.`
-				: `Game starts in ${startGamePause} second${startGamePause === 1 ? '' : 's'}.`;
-			io.in(game.general.uid).emit('gameUpdate', secureGame(game));
-		}
-		startGamePause--;
-		await new Promise(r => setTimeout(r, 1000));
-	}
-};
+			/* We do not have the right number of players, so the game should not start */
+			await gameSets.remove('starting', gameKey);
 
-/**
- * @param {string} gameKey - A game cache key
- * @param {Object} game - A game object
- */
-const checkStartConditions = async (gameKey, game) => {
-	if (game.gameState.isTracksFlipped) {
-		return;
-	}
-
-	if (game.electionCount !== 0) {
-		game.electionCount = 0;
-	}
-
-	if (
-		game.gameState.isStarted &&
-		(game.publicPlayersState.length < game.general.minPlayersCount || game.general.excludedPlayerCount.includes(game.publicPlayersState.length))
-	) {
-		game.gameState.cancellStart = true;
-		game.general.status = displayWaitingForPlayers(game);
-	} else if (
-		(!game.gameState.isStarted &&
-			game.publicPlayersState.length >= game.general.minPlayersCount &&
-			!game.general.excludedPlayerCount.includes(game.publicPlayersState.length)) ||
-		(game.general.isTourny && game.general.tournyInfo.queuedPlayers.length === game.general.maxPlayersCount)
-	) {
-		game.remakeData = game.publicPlayersState.map(player => ({ userName: player.userName, isRemaking: false, remakeTime: 0 }));
-		await startCountdown(gameKey, game);
-	} else if (!game.gameState.isStarted) {
-		game.general.status = displayWaitingForPlayers(game);
-	}
-};
-
-/**
- * Note: This assumes game has been acquired above in the call stack.
- * @param {string} userKey - A user cache key
- * @param {string} gameKey - A game cahce key
- * @param {Object} game - A loaded game object
- * @return {Promise<void>}
- */
-const playerLeavePretourny = async (userKey, gameKey, game) => {
-
-	const { queuedPlayers } = game.general.tournyInfo;
-
-	if (queuedPlayers.length === 1) {
-		await games.remove(gameKey);
-		return;
-	}
-
-	queuedPlayers.splice(
-		queuedPlayers.findIndex(player => player.userName === playerKey),
-		1
-	);
-
-	game.general.status = displayWaitingForPlayers(game);
-
-	await games.chatPush(gameKey, {
-		timestamp: new Date(),
-		gameChat: true,
-		chat: [
-			{
-				text: playerName,
-				type: 'player'
-			},
-			{
-				text: ` (${queuedPlayers.length}/${game.general.maxPlayersCount}) has left the tournament queue.`
-			}
-		]
-	});
-
-	sendInProgressGameUpdate(game);
-};
-
-/**
- * Note: This function may acquire a game lock that must be released before returning.
- * @param {string} [userKey] - An optional user cache key
- */
-const handleSocketDisconnect = async (userKey) => {
-
-	if (userKey != null) {
-		await groups.remove('online', userKey);
-		const gameKey = await userInfo.get(userKey, 'currentGame');
-
-		if (gameKey !== null) {
-			const release = await games.acquire(gameKey);
-			const game = await games.get(gameKey);
-
-			const { gameState, publicPlayersState } = game;
-			const playerIndex = publicPlayersState.findIndex(player => player.userName === userKey);
-
-			if (
-				(!gameState.isStarted && publicPlayersState.length === 1) ||
-				(gameState.isCompleted && publicPlayersState.filter(player => !player.connected || player.leftGame).length === game.general.playerCount - 1)
-			) {
-				// Remove games when the last player leaves
-				games.remove(gameKey).then(release);
-			} else if (!gameState.isTracksFlipped && playerIndex > -1) {
-				publicPlayersState.splice(playerIndex, 1);
-				await checkStartConditions(gameKey, game);
-				io.sockets.in(gameKey).emit('gameUpdate', game);
-			} else if (gameState.isTracksFlipped) {
-				publicPlayersState[playerIndex].connected = false;
-				publicPlayersState[playerIndex].leftGame = true;
-				const playerRemakeData = game.remakeData && game.remakeData.find(player => player.userName === userKey);
-				if (playerRemakeData && playerRemakeData.isRemaking) {
-					const minimumRemakeVoteCount = game.general.playerCount - game.customGameSettings.fascistCount;
-					const remakePlayerCount = game.remakeData.filter(player => player.isRemaking).length;
-
-					if (!game.general.isRemade && game.general.isRemaking && remakePlayerCount <= minimumRemakeVoteCount) {
-						game.general.isRemaking = false;
-						game.general.status = 'Game remaking has been cancelled.';
-					}
-					const chat = {
-						timestamp: new Date(),
-						gameChat: true,
-						chat: [
-							{
-								text: 'A player'
-							}, {
-								text: ` has left and rescinded their vote to ${game.general.isTourny ? 'cancel this tournament.' : 'remake this game.'} (${remakePlayerCount - 1}/${minimumRemakeVoteCount})`
-							}
-						]
-					};
-					await games.chatPush(gameKey, chat);
-					game.remakeData.find(player => player.userName === userKey).isRemaking = false;
-				}
-				sendInProgressGameUpdate(game);
-				if (game.publicPlayersState.filter(publicPlayer => publicPlayer.leftGame).length === game.general.playerCount) {
-					games.remove(gameKey).then(release);
-					return
-				}
-			}
-			games.set(gameKey, game).then(release);
+			await games.setState(gameKey, {
+				stage: stages.SETUP,
+				status: displayWaitingForPlayers(minPlayersCount, maxPlayersCount, excludedPlayerCount),
+				readyToStartAt: null
+			});
 		}
 	}
+	release();
 };
 
 const crashReport = JSON.stringify({
@@ -332,171 +119,180 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 /**
+ * Kicks all players from a game and removes that game.
+ * Note: You *must* lock gameKey before calling.
  *
- * @param {Object} socket - A socket reference
- * @param {string} userKey - A user cache key
- * @param {string} gameKey - A game cache key
- * @param {Object} data - Packet payload
+ * @param {string} gameKey - A game cach key
+ * @return {Promise<void>}
  */
-const handleUserLeaveGame = async (socket, userKey, gameKey, data) => {
-	const game = await games.get(gameKey);
+const removeGame = async (gameKey) => {
+	/*
+	 * It's possible there might be some users with this game set as 'currentGame'.
+	 * We need to remove them -- I will assume all are in the 'players' set of the game.
+	 */
+	const userKeys = await groups.members('players', gameKey);
+	for (const userKey of userKeys) {
+		await userInfo.delete(userKey, 'currentGame');
+	}
 
-	const playerIndex = game.publicPlayersState.findIndex(player => player.userName === userKey);
+	/* Now we can clean up redis */
+	await groups.emptyAll(gameKey);
+	await games.remove(gameKey);
+};
 
-	if (playerIndex > -1) {
-		const playerRemakeData = game.remakeData && game.remakeData.find(player => player.userName === userKey);
-		if (playerRemakeData && playerRemakeData.isRemaking) {
-			// Count leaving the game as rescinded remake vote.
-			const minimumRemakeVoteCount = game.general.playerCount - game.customGameSettings.fascistCount;
-			const remakePlayerCount = game.remakeData.filter(player => player.isRemaking).length;
+const calcMimumnRemake = async (gameKey) => {
+	const numPlayers = await groups.count('players', gameKey);
+	const numFascist = await groups.count('fascist', gameKey);
+	return numPlayers - numFascist;
+}
 
-			if (!game.general.isRemade && game.general.isRemaking && remakePlayerCount <= minimumRemakeVoteCount) {
-				game.general.isRemaking = false;
-				game.general.status = 'Game remaking has been cancelled.';
-				clearInterval(game.private.remakeTimer);
-			}
-			const chat = {
-				timestamp: new Date(),
-				gameChat: true,
-				chat: [
-					{
-						text: 'A player'
-					}
-				]
-			};
-			chat.chat.push({
-				text: ` has left and rescinded their vote to ${game.general.isTourny ? 'cancel this tournament.' : 'remake this game.'} (${remakePlayerCount -
-					1}/${minimumRemakeVoteCount})`
+const checkRemakeConditions = async (gameKey) => {
+
+	const release = await games.acquire(gameKey);
+	const { stage } = await games.getState(gameKey, 'stage');
+
+	if (stage !== stages.REMADE) {
+
+		const numRemake = await groups.count('remake', gameKey);
+		const numMinimumRemake = await calcMimumnRemake(gameKey);
+
+		if (numRemake > numMinimumRemake) {
+			/* Votes are sufficent, mark for remake */
+			await gameSets.add('remake'. gameKey);
+			await games.setState(gameKey, {
+				status: 'Game is being remade',
+				readyToRemakeAt: new Date()
+				/* We will use this time to scan through the 'remake' game set and remake games that
+         * are old enough. An await timer here might have odd side effects on multiple nodes.
+         */
 			});
-			await games.chatPush(gameKey, chat);
-			game.remakeData.find(player => player.userName === userKey).isRemaking = false;
-		}
-		if (game.gameState.isTracksFlipped) {
-			game.publicPlayersState[playerIndex].leftGame = true;
-		}
-		if (game.publicPlayersState.filter(publicPlayer => publicPlayer.leftGame).length === game.general.playerCount) {
-			delete games[game.general.uid];
-		}
-		if (!game.gameState.isTracksFlipped) {
-			game.publicPlayersState.splice(
-				game.publicPlayersState.findIndex(player => player.userName === userKey),
-				1
-			);
-			await checkStartConditions(gameKey, game);
-			io.sockets.in(gameKey).emit('gameUpdate', game);
+		} else {
+			/* Votes are insufficent, unmark for remake */
+			await gameSets.remove('remake'. gameKey);
+			await games.setState(gameKey, {
+				status: 'Remake aborted',
+				readyToRemakeAt: null
+			});
 		}
 	}
-
-	if (
-		game.general.isTourny &&
-		game.general.tournyInfo.round === 0 &&
-		game.general.tournyInfo.queuedPlayers.find(player => player.userName === userKey)
-	) {
-		await playerLeavePretourny(userKey, gameKey, game);
-	}
-
-	if (
-		(!game.publicPlayersState.length && !(game.general.isTourny && game.general.tournyInfo.round === 0)) ||
-		(game.general.isTourny && game.general.tournyInfo.round === 0 && !game.general.tournyInfo.queuedPlayers.length)
-	) {
-		io.sockets.in(game.general.uid).emit('gameUpdate', {});
-		if (!game.summarySaved && game.gameState.isTracksFlipped) {
-			const summary = game.private.summary.publish();
-			if (summary && summary.toObject() && game.general.uid !== 'devgame' && !game.general.private) {
-				summary.save();
-				game.summarySaved = true;
-			}
-		}
-		await games.remove(gameKey);
-	} else if (game.gameState.isTracksFlipped) {
-		sendInProgressGameUpdate(game);
-		await games.set(gameKey, game)
-	}
-
-	if (!data.isRemake) {
-		await updateUserStatus(userKey, null, null);
-		socket.emit('gameUpdate', {});
-	}
-	await sendGameList();
+	release();
 };
 
 /**
- * @param {object} socket - user socket reference.
- * @param {object} passport - socket authentication.
- * @param {object} data - from socket emit.
+ * Removes a user from a game lobby.
+ *
+ * @param {string} userKey - A user cache key
  */
-const updateSeatedUser = async (socket, userKey, gameKey) => {
-	const game = await games.get(gameKey);
+const handleUserLeaveGame = async (userKey) => {
+
+	/* Get the user's current game (they cant very well leave a game they are not in, can they?) */
+	const { currentGame } = await userInfo.get(userKey, 'currentGame');
+
+	if (currentGame !== null) {
+
+		/*
+		 * If the user is actually seated in the game (not just spectating it),
+		 * then we will need to update the game information.
+		 */
+		if (await groups.isMember(userKey, 'players', currentGame)) {
+
+			/* The user is disconnected and is playing -- remove them from present players */
+			await groups.remove(userKey, 'present', currentGame);
+
+			const { stage } = await games.getState(currentGame , 'stage');
+			const numPresent = await groups.count('present', currentGame);
+
+			if (numPresent < 1) {
+				/*
+				 * If no one is present,
+				 * then we should remove this game.
+				 */
+				await userInfo.delete(userKey, 'currentGame');
+				await removeGame(currentGame);
+
+			} else if (stage !== stages.PLAYING) {
+				/*
+				 * If there are more than one person present and the game is not being played,
+				 * then we should remove this player.
+				 */
+				await userInfo.delete(userKey, 'currentGame');
+				await groups.removeFromAll(userKey, currentGame); /* Remove the user from all of this game's groups */
+				await checkStartConditions(currentGame);
+
+			} else if (stage === stages.PLAYING) {
+				/*
+				 * If the game is in play,
+				 * then we may need to update remakes.
+				 */
+
+				/* Remake votes are void if you leave */
+				await groups.remove(userKey, 'remake', currentGame);
+				await checkRemakeConditions(currentGame);
+			}
+		}
+	}
+};
+
+/**
+ * Handles a socket disconnect.
+ *
+ * Note: This function may acquire a game lock that must be released before returning.
+ * @param {string} [userKey] - An optional user cache key
+ */
+const handleSocketDisconnect = async (userKey) => {
+
+	/* Remove the user from the online group */
+	await groups.remove('online', userKey);
+
+	if (userKey != null) {
+		/* If the user was in a game lobby, pretend that they left */
+		await handleUserLeaveGame(userKey);
+	}
+};
+
+/**
+ * Gives userKey a seat at gameKey.
+ *
+ * @param {object} socket - A socket reference
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @param {string} [password] - Game password
+ */
+const updateSeatedUser = async (socket, userKey, gameKey, password) => {
 	const limitNewPlayers = await options.get('limitNewPlayers', false);
 	// prevents race condition between 1) taking a seat and 2) the game starting
 
-	if (!game.gameState.isTracksFlipped) {
-		const account = await Account.findOne({ username: userKey });
-		const isNotMaxedOut = game.publicPlayersState.length < game.general.maxPlayersCount;
-		const isNotInGame = !game.publicPlayersState.find(player => player.userName === passport.user);
-		const isRainbowSafe = !game.general.rainbowgame || (game.general.rainbowgame && account.wins + account.losses > 49);
-		const isPrivateSafe =
-			!game.general.private ||
-			(game.general.private && (data.password === game.private.privatePassword || game.general.whitelistedPlayers.includes(userKey)));
-		const isBlacklistSafe = !game.general.gameCreatorBlacklist || !game.general.gameCreatorBlacklist.includes(userKey);
-		const isMeetingEloMinimum = !game.general.eloMinimum || game.general.eloMinimum <= account.eloSeason || game.general.eloMinimum <= account.eloOverall;
+	const stage = await games.getState(gameKey, 'stage');
 
-		if (account.wins + account.losses < 3 && limitNewPlayers && !game.general.private) {
+	if (stage === stages.SETUP || stage === stages.STARTING) {
+		/* if the game is not being played yet */
+
+		const user = await userInfo.get(userKey);
+		const numPlayers = await groups.count('players', gameKey);
+		const { maxPlayersCount, isRainbow, isPrivate, privatePassword, whitelist, blacklist, eloMinimum }
+		  = await games.getConfig(gameKey, 'maxPlayersCount', 'isRainbow', 'isPrivate', 'privatePassword', 'whitelist', 'blacklist', 'eloMinimum');
+
+		if (user.wins + user.losses < 3 && limitNewPlayers && !isPrivate) {
 			return;
 		}
 
+		const isNotMaxedOut = numPlayers < maxPlayersCount;
+		const isNotInGame = !(await groups.isMember('players', userKey, gameKey));
+		const isRainbowSafe = isRainbow || (isRainbow && user.wins + user.losses > 49);
+		const isPrivateSafe = !isPrivate|| (isPrivate && password === privatePassword) || whitelist.includes(userKey);
+		const isBlacklistSafe = !blacklist.includes(userKey);
+		const isMeetingEloMinimum = eloMinimum == null || eloMinimum <= user.eloSeason || eloMinimum <= user.eloOverall;
+
 		if (isNotMaxedOut && isNotInGame && isRainbowSafe && isPrivateSafe && isBlacklistSafe && isMeetingEloMinimum) {
-			const { publicPlayersState } = game;
-			const player = {
-				userName: userKey,
-				connected: true,
-				isDead: false,
-				customCardback: account.gameSettings.customCardback,
-				customCardbackUid: account.gameSettings.customCardbackUid,
-				isPrivate: account.gameSettings.isPrivate,
-				tournyWins: account.gameSettings.tournyWins,
-				previousSeasonAward: account.gameSettings.previousSeasonAward,
-				specialTournamentStatus: account.gameSettings.specialTournamentStatus,
-				staffDisableVisibleElo: account.gameSettings.staffDisableVisibleElo,
-				staffDisableStaffColor: account.gameSettings.staffDisableStaffColor,
-				cardStatus: {
-					cardDisplayed: false,
-					isFlipped: false,
-					cardFront: 'secretrole',
-					cardBack: {}
-				}
-			};
-
-			if (game.general.isTourny) {
-				if (
-					game.general.tournyInfo.queuedPlayers.map(player => player.userName).includes(player.userName) ||
-					game.general.tournyInfo.queuedPlayers.length >= game.general.maxPlayersCount
-				) {
-					return;
-				}
-				game.general.tournyInfo.queuedPlayers.push(player);
-				games.chatPush(gameKey, {
-					timestamp: new Date(),
-					gameChat: true,
-					chat: [
-						{
-							text: `${userKey}`,
-							type: 'player'
-						},
-						{
-							text: ` (${game.general.tournyInfo.queuedPlayers.length}/${game.general.maxPlayersCount}) has entered the tournament queue.`
-						}
-					]
-				});
-			} else {
-				publicPlayersState.unshift(player);
-			}
-
-			await games.set(userKey, game);
-
+			await groups.add('players', userKey, gameKey);
+			await games.setCard(gameKey, userKey, {
+				displayed: false,
+				flipped: false,
+				front: 'secretrole',
+				back: {}
+			});
 			socket.emit('updateSeatForUser', true);
-			await checkStartConditions(game);
-			await updateUserStatus(userKey, gameKey);
+			await checkStartConditions(gameKey);
 			io.sockets.in(gameKey).emit('gameUpdate', secureGame(game));
 			sendGameList();
 		}
@@ -519,6 +315,24 @@ module.exports.handleUpdatedBio = (socket, userKey, data) => {
 };
 
 /**
+ * Gets the formatted staffrole for a userKey.
+ *
+ * @param {string} userKey - A user cache key
+ * @return {string}
+ */
+const getStaffRole = async userKey => {
+	const userGroups = await groups.ofMember(userKey);
+	if (userGroups.includes('moderator')) {
+		return 'moderator';
+	} else if (userGroups.includes('editor')) {
+		return 'editor';
+	} else if (userGroups.includes('admin')) {
+		return 'admin';
+	}
+	return '';
+};
+
+/**
  * @param {object} socket - A socket reference
  * @param {string} userKey - A user cache key
  * @param {object} data - Message payload
@@ -531,1189 +345,198 @@ module.exports.handleAddNewGame = async (socket, userKey, data) => {
 		return;
 	}
 
-	const user = userInfo.get(userKey);
-	const currentTime = new Date();
+	const release = await userInfo.acquire(userKey).writeLock();
+	try {
+		console.log('acquired');
+		const user = await userInfo.get(userKey);
 
-	if (currentTime - user < 8000 || 'currentGame' in user) {
-		return;
-	}
-
-	// Make sure it exists
-	if (!data) return;
-
-	let a;
-	let playerCounts = [];
-	for (a = Math.max(data.minPlayersCount, 5); a <= Math.min(10, data.maxPlayersCount); a++) {
-		if (!data.excludedPlayerCount.includes(a)) playerCounts.push(a);
-	}
-	if (playerCounts.length === 0) {
-		// Someone is messing with the data, ignore it
-		return;
-	}
-
-	const excludes = [];
-	for (a = playerCounts[0]; a <= playerCounts[playerCounts.length - 1]; a++) {
-		if (!playerCounts.includes(a)) excludes.push(a);
-	}
-
-	if (!data.gameName || data.gameName.length > 20 || !LEGALCHARACTERS(data.gameName)) {
-		// Should be enforced on the client. Copy-pasting characters can get past the LEGALCHARACTERS client check.
-		return;
-	}
-
-	if (data.eloSliderValue && (user.eloSeason < data.eloSliderValue || user.eloOverall < data.eloSliderValue)) {
-		return;
-	}
-
-	if (data.customGameSettings && data.customGameSettings.enabled) {
-		if (!data.customGameSettings.deckState || !data.customGameSettings.trackState) return;
-
-		const validPowers = ['investigate', 'deckpeek', 'election', 'bullet', 'reverseinv', 'peekdrop'];
-		if (!data.customGameSettings.powers || data.customGameSettings.powers.length != 5) return;
-		for (let a = 0; a < 5; a++) {
-			if (data.customGameSettings.powers[a] == '' || data.customGameSettings.powers[a] == 'null') data.customGameSettings.powers[a] = null;
-			else if (data.customGameSettings.powers[a] && !validPowers.includes(data.customGameSettings.powers[a])) return;
-		}
-
-		if (!(data.customGameSettings.hitlerZone >= 1) || data.customGameSettings.hitlerZone > 5) return;
-		if (
-			!data.customGameSettings.vetoZone ||
-			data.customGameSettings.vetoZone <= data.customGameSettings.trackState.fas ||
-			data.customGameSettings.vetoZone > 5
-		) {
+		if ('currentGame' in user) {
 			return;
 		}
 
-		// Ensure that there is never a fas majority at the start.
-		// Custom games should probably require a fixed player count, which will be in playerCounts[0] regardless.
-		if (!(data.customGameSettings.fascistCount >= 1) || data.customGameSettings.fascistCount + 1 > playerCounts[0] / 2) return;
-
-		// Ensure standard victory conditions can be met for both teams.
-		if (!(data.customGameSettings.deckState.lib >= 5) || data.customGameSettings.deckState.lib > 8) return;
-		if (!(data.customGameSettings.deckState.fas >= 6) || data.customGameSettings.deckState.fas > 19) return;
-
-		// Roundabout way of checking for null/undefined but not 0.
-		if (!(data.customGameSettings.trackState.lib >= 0) || data.customGameSettings.trackState.lib > 4) return;
-		if (!(data.customGameSettings.trackState.fas >= 0) || data.customGameSettings.trackState.fas > 5) return;
-
-		// Need at least 13 cards (11 on track plus two left-overs) to ensure that the deck does not run out.
-		if (data.customGameSettings.deckState.lib + data.customGameSettings.deckState.fas < 13) return;
-
-		if (
-			!(data.customGameSettings.trackState.lib >= 0) ||
-			data.customGameSettings.trackState.lib > 4 ||
-			!(data.customGameSettings.trackState.fas >= 0) ||
-			data.customGameSettings.trackState.fas > 5
-		) {
+		let a;
+		let playerCounts = [];
+		for (a = Math.max(data.minPlayersCount, 5); a <= Math.min(10, data.maxPlayersCount); a++) {
+			if (!data.excludedPlayerCount.includes(a)) playerCounts.push(a);
+		}
+		if (playerCounts.length === 0) {
+			// Someone is messing with the data, ignore it
 			return;
 		}
 
-		data.casualGame = true; // Force this on if everything looks ok.
-		playerCounts = [playerCounts[0]]; // Lock the game to a specific player count. Eventually there should be one set of settings per size.
-	} else {
-		data.customGameSettings = {
-			enabled: false
-		};
-	}
+		const excludes = [];
+		for (a = playerCounts[0]; a <= playerCounts[playerCounts.length - 1]; a++) {
+			if (!playerCounts.includes(a)) excludes.push(a);
+		}
 
-	const newGame = {
-		gameState: {
-			previousElectedGovernment: [],
-			undrawnPolicyCount: 17,
-			discardedPolicyCount: 0,
-			presidentIndex: -1
-		},
-		chats: [],
-		general: {
-			whitelistedPlayers: [],
+		if (!data.gameName || data.gameName.length > 20 || !LEGALCHARACTERS(data.gameName)) {
+			// Should be enforced on the client. Copy-pasting characters can get past the LEGALCHARACTERS client check.
+			return;
+		}
+
+		if (data.eloSliderValue && (user.eloSeason < data.eloSliderValue || user.eloOverall < data.eloSliderValue)) {
+			return;
+		}
+
+		if (data.customGameSettings && data.customGameSettings.enabled) {
+			if (!data.customGameSettings.deckState || !data.customGameSettings.trackState) return;
+
+			const validPowers = ['investigate', 'deckpeek', 'election', 'bullet', 'reverseinv', 'peekdrop'];
+			if (!data.customGameSettings.powers || data.customGameSettings.powers.length != 5) return;
+			for (let a = 0; a < 5; a++) {
+				if (data.customGameSettings.powers[a] == '' || data.customGameSettings.powers[a] == 'null') data.customGameSettings.powers[a] = null;
+				else if (data.customGameSettings.powers[a] && !validPowers.includes(data.customGameSettings.powers[a])) return;
+			}
+
+			if (!(data.customGameSettings.hitlerZone >= 1) || data.customGameSettings.hitlerZone > 5) return;
+			if (
+				!data.customGameSettings.vetoZone ||
+				data.customGameSettings.vetoZone <= data.customGameSettings.trackState.fas ||
+				data.customGameSettings.vetoZone > 5
+			) {
+				return;
+			}
+
+			// Ensure that there is never a fas majority at the start.
+			// Custom games should probably require a fixed player count, which will be in playerCounts[0] regardless.
+			if (!(data.customGameSettings.fascistCount >= 1) || data.customGameSettings.fascistCount + 1 > playerCounts[0] / 2) return;
+
+			// Ensure standard victory conditions can be met for both teams.
+			if (!(data.customGameSettings.deckState.lib >= 5) || data.customGameSettings.deckState.lib > 8) return;
+			if (!(data.customGameSettings.deckState.fas >= 6) || data.customGameSettings.deckState.fas > 19) return;
+
+			// Roundabout way of checking for null/undefined but not 0.
+			if (!(data.customGameSettings.trackState.lib >= 0) || data.customGameSettings.trackState.lib > 4) return;
+			if (!(data.customGameSettings.trackState.fas >= 0) || data.customGameSettings.trackState.fas > 5) return;
+
+			// Need at least 13 cards (11 on track plus two left-overs) to ensure that the deck does not run out.
+			if (data.customGameSettings.deckState.lib + data.customGameSettings.deckState.fas < 13) return;
+
+			if (
+				!(data.customGameSettings.trackState.lib >= 0) ||
+				data.customGameSettings.trackState.lib > 4 ||
+				!(data.customGameSettings.trackState.fas >= 0) ||
+				data.customGameSettings.trackState.fas > 5
+			) {
+				return;
+			}
+
+			data.casualGame = true; // Force this on if everything looks ok.
+			playerCounts = [playerCounts[0]]; // Lock the game to a specific player count. Eventually there should be one set of settings per size.
+		} else {
+			data.customGameSettings = {
+				enabled: false
+			};
+		}
+
+		const gameKey = generateCombination(3, '', true);
+		await gameSets.add('active', gameKey);
+		/* State is for things that can change after game start */
+		await games.setState(gameKey, {
+			status: `Waiting for ${playerCounts[0] - 1} more players..`,
+			stage: stages.STARTING,
+			fascistDeck: 11,
+			liberalDeck: 6,
+			fascistDiscard: 0,
+			liberalDiscard: 0,
+			fascistPlayed: 0,
+			liberalPlayed: 0,
+			fascistHand: 0,
+			liberalHand: 0,
+		});
+		/* Config is for things that should not change after game start */
+		await games.setConfig(gameKey, {
 			name: user.isPrivate ? 'Private Game' : data.gameName ? data.gameName : 'New Game',
+			whiteList: [],
+			blacklist: user.blacklist,
 			flag: data.flag || 'none', // TODO: verify that the flag exists, or that an invalid flag does not cause issues
 			minPlayersCount: playerCounts[0],
 			gameCreatorName: user.userName,
-			gameCreatorBlacklist: user.blacklist,
 			excludedPlayerCount: excludes,
 			maxPlayersCount: playerCounts[playerCounts.length - 1],
-			status: `Waiting for ${playerCounts[0] - 1} more players..`,
 			experiencedMode: data.experiencedMode,
 			disableChat: data.disableChat,
 			isVerifiedOnly: data.isVerifiedOnly,
-			disableObserver: data.disableObserver && !data.isTourny,
-			isTourny: false,
-			lastModPing: 0,
-			chatReplTime: Array(chatReplacements.length + 1).fill(0),
+			disableObserver: data.disableObserver,
 			disableGamechat: data.disableGamechat,
-			rainbowgame: user.wins + user.losses > 49 ? data.rainbowgame : false,
-			blindMode: data.blindMode,
-			timedMode: typeof data.timedMode === 'number' && data.timedMode >= 2 && data.timedMode <= 6000 ? data.timedMode : false,
-			flappyMode: data.flappyMode,
-			flappyOnlyMode: data.flappyMode && data.flappyOnlyMode,
-			casualGame: typeof data.timedMode === 'number' && data.timedMode < 30 && !data.casualGame ? true : data.casualGame,
+			isRainbow: user.wins + user.losses > 49 ? data.rainbowgame : false,
+			isBlindMode: data.blindMode,
+			isRimedMode: typeof data.timedMode === 'number' && data.timedMode >= 2 && data.timedMode <= 6000 ? data.timedMode : false,
+			isFlappyMode: data.flappyMode,
+			isFlappyOnlyMode: data.flappyMode && data.flappyOnlyMode,
+			isCasual: typeof data.timedMode === 'number' && data.timedMode < 30 && !data.casualGame ? true : data.casualGame,
 			rebalance6p: data.rebalance6p,
 			rebalance7p: data.rebalance7p,
 			rebalance9p2f: data.rebalance9p2f,
-			unlisted: data.unlistedGame && !data.privatePassword,
-			private: user.isPrivate ? (data.privatePassword ? data.privatePassword : 'private') : !data.unlistedGame && data.privatePassword,
+			isUnlisted: data.unlistedGame && !data.privatePassword,
+			isPrivate: user.isPrivate ? (data.privatePassword ? data.privatePassword : 'private') : !data.unlistedGame && data.privatePassword,
 			privateOnly: user.isPrivate,
-			electionCount: 0,
-			isRemade: false,
-			eloMinimum: data.eloSliderValue
-		},
-		customGameSettings: data.customGameSettings,
-		publicPlayersState: [],
-		playersState: [],
-		cardFlingerState: [],
-		trackState: {
-			liberalPolicyCount: 0,
-			fascistPolicyCount: 0,
-			electionTrackerCount: 0,
-			enactedPolicies: []
-		}
-	};
-
-	if (newGame.customGameSettings.enabled) {
-		let chat = {
-			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: 'There will be '
-				},
-				{
-					text: `${newGame.customGameSettings.deckState.lib - newGame.customGameSettings.trackState.lib} liberal`,
-					type: 'liberal'
-				},
-				{
-					text: ' and '
-				},
-				{
-					text: `${newGame.customGameSettings.deckState.fas - newGame.customGameSettings.trackState.fas} fascist`,
-					type: 'fascist'
-				},
-				{
-					text: ' policies in the deck.'
-				}
-			]
-		};
-		const t = chat.timestamp.getMilliseconds();
-		newGame.chats.push(chat);
-		chat = {
-			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: 'The game will start with '
-				},
-				{
-					text: `${newGame.customGameSettings.trackState.lib} liberal`,
-					type: 'liberal'
-				},
-				{
-					text: ' and '
-				},
-				{
-					text: `${newGame.customGameSettings.trackState.fas} fascist`,
-					type: 'fascist'
-				},
-				{
-					text: ' policies.'
-				}
-			]
-		};
-		chat.timestamp.setMilliseconds(t + 1);
-		newGame.chats.push(chat);
-	}
-
-	if (data.isTourny) {
-		newGame.general.tournyInfo = {
-			round: 0,
-			queuedPlayers: [
-				{
-					userName: user.userName,
-					customCardback: user.customCardback,
-					customCardbackUid: user.customCardbackUid,
-					tournyWins: user.tournyWins,
-					connected: true,
-					cardStatus: {
-						cardDisplayed: false,
-						isFlipped: false,
-						cardFront: 'secretrole',
-						cardBack: {}
-					}
-				}
-			]
-		};
-	} else {
-		newGame.publicPlayersState = [
-			{
-				userName: user.userName,
-				customCardback: user.customCardback,
-				customCardbackUid: user.customCardbackUid,
-				previousSeasonAward: user.previousSeasonAward,
-				specialTournamentStatus: user.specialTournamentStatus,
-				tournyWins: user.tournyWins,
-				connected: true,
-				isPrivate: user.isPrivate,
-				cardStatus: {
-					cardDisplayed: false,
-					isFlipped: false,
-					cardFront: 'secretrole',
-					cardBack: {}
-				}
-			}
-		];
-	}
-
-	if (data.isTourny) {
-		const { minPlayersCount } = newGame.general;
-
-		newGame.general.minPlayersCount = newGame.general.maxPlayersCount = minPlayersCount === 1 ? 14 : minPlayersCount === 2 ? 16 : 18;
-		newGame.general.status = `Waiting for ${newGame.general.minPlayersCount - 1} more players..`;
-		newGame.chats.push({
-			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: `${user.userName}`,
-					type: 'player'
-				},
-				{
-					text: ` (${data.general.tournyInfo.queuedPlayers.length}/${data.general.maxPlayersCount}) has entered the tournament queue.`
-				}
-			]
+			password: data.privatePassword,
+			eloMinimum: data.eloSliderValue,
+			isCustom: data.customGameSettings.enabled,
+			timeCreated: currentTime,
+			...data.customGameSettings /* Just chuck the custom game settings in here too */
 		});
+
+		await userInfo.set(userKey, 'timeLastGameCreated', currentTime);
+		console.log('done');
+	} catch (e) {
+		console.error(e);
+	} finally {
+		console.log('unlocking');
+		release();
+		console.log('unlock');
 	}
 
-	user.timeLastGameCreated = currentTime;
+	console.log('joining game');
 
-	newGame.private = {
-		reports: {},
-		unSeatedGameChats: [],
-		lock: {},
-		votesPeeked: false,
-		invIndex: -1,
-		hiddenInfoChat: [],
-		hiddenInfoSubscriptions: [],
-		hiddenInfoShouldNotify: true
-	};
-
-	if (newGame.general.private) {
-		newGame.private.privatePassword = newGame.general.private;
-		newGame.general.private = true;
-	}
-
-	newGame.general.timeCreated = currentTime;
-
-	const gameKey = await games.register(newGame);
-	await updateUserStatus(userKey, gameKey);
-	await sendGameList();
-	socket.join(gameKey);
-	socket.emit('updateSeatForUser');
-	socket.emit('gameUpdate', newGame);
-	socket.emit('joinGameRedirect', gameKey);
+	/* Auto-join the creator */
+	await joinGameLobby(socket, gameKey, userKey);
+	await updateSeatedUser(socket, userKey, gameKey, data.privatePassword);
 };
 
 /**
- * @param {object} socket - User socket reference
- * @param {string} userKey - A user cache key
- * @param {string} gameKey - A game cache key
- * @param {object} data - A data packet
- * @return {Promise<boolean>} Successful claim
- */
-module.exports.handleAddNewClaim = async (socket, userKey, gameKey, data) => {
-	const game = await games.get(gameKey);
-
-	const playerIndex = game.publicPlayersState.findIndex(player => player.userName === userKey);
-
-	if (
-		!/^(wasPresident|wasChancellor|didSinglePolicyPeek|didPolicyPeek|didInvestigateLoyalty)$/.exec(
-			game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim
-		)
-	) {
-		return false;
-	}
-
-	if (!game.private || !game.private.summary || game.publicPlayersState[playerIndex].isDead) {
-		return false;
-	}
-	const { blindMode, replacementNames } = game.general;
-
-	const chat = (() => {
-		let text;
-
-		switch (data.claim) {
-			case 'wasPresident':
-				text = [
-					{
-						text: 'President '
-					},
-					{
-						text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-						type: 'player'
-					}
-				];
-				switch (data.claimState) {
-					case 'rrr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								presidentClaim: { reds: 3, blues: 0 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'RRR',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rrb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								presidentClaim: { reds: 2, blues: 1 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'RR',
-								type: 'fascist'
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rbb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								presidentClaim: { reds: 1, blues: 2 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'BB',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'bbb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								presidentClaim: { reds: 0, blues: 3 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'BBB',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-				}
-
-			case 'wasChancellor':
-				text = [
-					{
-						text: 'Chancellor '
-					},
-					{
-						text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-						type: 'player'
-					}
-				];
-				switch (data.claimState) {
-					case 'rr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								chancellorClaim: { reds: 2, blues: 0 }
-							},
-							{ chancellorId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'RR',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								chancellorClaim: { reds: 1, blues: 1 }
-							},
-							{ chancellorId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'bb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								chancellorClaim: { reds: 0, blues: 2 }
-							},
-							{ chancellorId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims '
-							},
-							{
-								text: 'BB',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-				}
-			case 'didSinglePolicyPeek':
-				if (data.claimState === 'liberal' || data.claimState === 'fascist') {
-					text = [
-						{
-							text: 'President '
-						},
-						{
-							text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-							type: 'player'
-						},
-						{
-							text: ' claims to have peeked at a '
-						},
-						{
-							text: data.claimState,
-							type: data.claimState
-						},
-						{
-							text: ' policy.'
-						}
-					];
-					return text;
-				}
-			case 'didPolicyPeek':
-				text = [
-					{
-						text: 'President '
-					},
-					{
-						text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-						type: 'player'
-					}
-				];
-				switch (data.claimState) {
-					case 'rrr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 3, blues: 0 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'RRR',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rbr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 2, blues: 1 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'brr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 2, blues: 1 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rrb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 2, blues: 1 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'rbb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 1, blues: 2 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'BB',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'bbr':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 1, blues: 2 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'BB',
-								type: 'liberal'
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'brb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 1, blues: 2 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: 'R',
-								type: 'fascist'
-							},
-							{
-								text: 'B',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-					case 'bbb':
-						game.private.summary = game.private.summary.updateLog(
-							{
-								policyPeekClaim: { reds: 0, blues: 3 }
-							},
-							{ presidentId: playerIndex }
-						);
-
-						text.push(
-							{
-								text: 'claims to have peeked at '
-							},
-							{
-								text: 'BBB',
-								type: 'liberal'
-							},
-							{
-								text: '.'
-							}
-						);
-
-						return text;
-				}
-			case 'didInvestigateLoyalty':
-				const { invIndex } = game.private;
-				if (invIndex != -1 && invIndex < game.private.seatedPlayers.length) {
-					text = [
-						{
-							text: 'President '
-						},
-						{
-							text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-							type: 'player'
-						},
-						{
-							text: 'sees the party membership of '
-						},
-						{
-							text: blindMode
-								? `${replacementNames[invIndex]} {${invIndex + 1}} `
-								: `${game.private.seatedPlayers[invIndex] && game.private.seatedPlayers[invIndex].userName} {${invIndex + 1}} `,
-							type: 'player'
-						},
-						{
-							text: 'and claims to see a member of the '
-						}
-					];
-				} else {
-					text = [
-						{
-							text: 'President '
-						},
-						{
-							text: blindMode ? `${replacementNames[playerIndex]} {${playerIndex + 1}} ` : `${userKey} {${playerIndex + 1}} `,
-							type: 'player'
-						},
-						{
-							text: ' claims to see a member of the '
-						}
-					];
-				}
-
-				game.private.summary = game.private.summary.updateLog(
-					{
-						investigationClaim: data.claimState
-					},
-					{ presidentId: playerIndex }
-				);
-				switch (data.claimState) {
-					case 'fascist':
-						text.push(
-							{
-								text: 'fascist ',
-								type: 'fascist'
-							},
-							{
-								text: 'team.'
-							}
-						);
-
-						return text;
-					case 'liberal':
-						text.push(
-							{
-								text: 'liberal ',
-								type: 'liberal'
-							},
-							{
-								text: 'team.'
-							}
-						);
-						return text;
-				}
-		}
-	})();
-	await games.set(gameKey, game).then(release);
-
-	if (
-		Number.isInteger(playerIndex) &&
-		game.private.seatedPlayers[playerIndex] &&
-		game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim !== ''
-	) {
-		const claimChat = {
-			chat: chat,
-			isClaim: true,
-			timestamp: new Date(),
-			uid: game.general.uid,
-			userName: passport.user,
-			claim: data.claim,
-			claimState: data.claimState
-		};
-		if (claimChat && claimChat.chat) {
-			if (game.private.seatedPlayers[playerIndex]) game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim = '';
-			await games.chatPush(gameKey, claimChat);
-			socket.emit('removeClaim');
-			sendInProgressGameUpdate(game);
-			return true;
-		}
-		return false;
-	}
-};
-
-/**
- * @param {Object} socket - Socket refference
+ * @param {Object} socket - Socket reference
  * @param {string} userKey - A user cache key
  * @param {string} gameKey - A game cache key
  * @param {Object} data - Message payload
  */
-module.exports.handleUpdatedRemakeGame = (socket, userKey, gameKey, data) => {
-	const game = games.get(gameKey);
+module.exports.handleUpdatedRemakeGame = async (socket, userKey, gameKey) => {
 
-	if (game.general.isRemade) {
-		return; // Games can only be remade once.
-	}
+	const { stage, seats } = await games.getState(gameKey, 'stage', 'seats');
 
-	if (game.gameState.isGameFrozen) {
-		if (socket) {
-			socket.emit('sendAlert', 'An AEM member has prevented this game from proceeding. Please wait.');
-		}
-		return;
-	}
+	if ( stage !== stages.REMADE ) {
 
-	const remakeText = game.general.isTourny ? 'cancel' : 'remake';
-	const { remakeData, publicPlayersState } = game;
-	const playerIndex = remakeData.findIndex(player => player.userName === passport.user);
-	const player = remakeData[playerIndex];
-	let chat;
-	const minimumRemakeVoteCount =
-		(game.customGameSettings.fascistCount && game.general.playerCount - game.customGameSettings.fascistCount) || Math.floor(game.general.playerCount / 2) + 2;
-	if (game && game.general && game.general.private) {
-		chat = {
+		const { isPrivate } = await games.getConfig(gameKey, 'isPrivate');
+
+		const chat = {
 			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: 'Player '
-				},
-				{
-					text: `${passport.user} {${playerIndex + 1}} `,
-					type: 'player'
-				}
-			]
+			chat: isPrivate ? [{ text: 'Player ' }, { text: `${userKey} {${seats.indexOf(userKey) + 1}} `,  type: 'player' }] : [{ text: 'A player' }]
 		};
-	} else {
-		chat = {
-			timestamp: new Date(),
-			gameChat: true,
-			chat: [
-				{
-					text: 'A player'
-				}
-			]
-		};
-	}
 
-	const makeNewGame = async () => {
-		if (gameCreationDisabled.status) {
-			games.chatPush(gameKey, {
-				gameChat: true,
-				timestamp: new Date(),
-				chat: [
-					{
-						text: 'Game remake aborted, game creation is currently disabled.',
-						type: 'hitler'
-					}
-				]
+		const numRemake = await groups.count('remake', gameKey);
+		const numMinimumRemake = await calcMimumnRemake(gameKey);
+
+		if (await groups.isMember('remake', userKey, gameKey)) {
+			/* Toggle remake off */
+			socket.emit('updateRemakeVoting', false);
+			await groups.remove('remake', userKey, gameKey);
+			chat.chat.push({
+				text: ` has voted to remake this game. (${numRemake}/${numMinimumRemake})`
 			});
-			sendInProgressGameUpdate(game);
-			return;
-		}
-
-		const newGame = _.cloneDeep(game);
-		const remakePlayerNames = remakeData.filter(player => player.isRemaking).map(player => player.userName);
-		const remakePlayerSocketIDs = Object.keys(io.sockets.sockets).filter(
-			socketId =>
-				io.sockets.sockets[socketId].handshake.session.passport && remakePlayerNames.includes(io.sockets.sockets[socketId].handshake.session.passport.user)
-		);
-		sendInProgressGameUpdate(game);
-
-		newGame.gameState = {
-			previousElectedGovernment: [],
-			undrawnPolicyCount: 17,
-			discardedPolicyCount: 0,
-			presidentIndex: -1
-		};
-
-		newGame.chats = [];
-		if (newGame.customGameSettings.enabled) {
-			let chat = {
-				timestamp: new Date(),
-				gameChat: true,
-				chat: [
-					{
-						text: 'There will be '
-					},
-					{
-						text: `${newGame.customGameSettings.deckState.lib - newGame.customGameSettings.trackState.lib} liberal`,
-						type: 'liberal'
-					},
-					{
-						text: ' and '
-					},
-					{
-						text: `${newGame.customGameSettings.deckState.fas - newGame.customGameSettings.trackState.fas} fascist`,
-						type: 'fascist'
-					},
-					{
-						text: ' policies in the deck.'
-					}
-				]
-			};
-			const t = chat.timestamp.getMilliseconds();
-			newGame.chats.push(chat);
-			chat = {
-				timestamp: new Date(),
-				gameChat: true,
-				chat: [
-					{
-						text: 'The game will start with '
-					},
-					{
-						text: `${newGame.customGameSettings.trackState.lib} liberal`,
-						type: 'liberal'
-					},
-					{
-						text: ' and '
-					},
-					{
-						text: `${newGame.customGameSettings.trackState.fas} fascist`,
-						type: 'fascist'
-					},
-					{
-						text: ' policies.'
-					}
-				]
-			};
-			chat.timestamp.setMilliseconds(t + 1);
-			newGame.chats.push(chat);
-		}
-		newGame.general.isRemade = false;
-		newGame.general.isRemaking = false;
-		newGame.general.isRecorded = false;
-		newGame.general.gameCreatorBlacklist = await userInfo.get(game.general.gameCreatorName, 'blackList');
-		newGame.summarySaved = false;
-		newGame.general.electionCount = 0;
-		newGame.timeCreated = Date.now();
-		newGame.general.lastModPing = 0;
-		newGame.general.chatReplTime = Array(chatReplacements.length + 1).fill(0);
-		newGame.publicPlayersState = game.publicPlayersState
-			.filter(player =>
-				game.remakeData
-					.filter(rmkPlayer => rmkPlayer.isRemaking)
-					.map(rmkPlayer => rmkPlayer.userName)
-					.some(rmkPlayer => rmkPlayer === player.userName)
-			)
-			.map(player => ({
-				userName: player.userName,
-				customCardback: player.customCardback,
-				customCardbackUid: player.customCardbackUid,
-				previousSeasonAward: player.previousSeasonAward,
-				connected: player.connected,
-				isRemakeVoting: false,
-				pingTime: undefined,
-				cardStatus: {
-					cardDisplayed: false,
-					isFlipped: false,
-					cardFront: 'secretrole',
-					cardBack: {}
-				}
-			}));
-		newGame.remakeData = [];
-		newGame.playersState = [];
-		newGame.cardFlingerState = [];
-		newGame.trackState = {
-			liberalPolicyCount: 0,
-			fascistPolicyCount: 0,
-			electionTrackerCount: 0,
-			enactedPolicies: []
-		};
-		newGame.private = {
-			reports: {},
-			unSeatedGameChats: [],
-			lock: {},
-			votesPeeked: false,
-			invIndex: -1,
-			privatePassword: game.private.privatePassword,
-			hiddenInfoChat: [],
-			hiddenInfoSubscriptions: [],
-			hiddenInfoShouldNotify: true
-		};
-
-		game.publicPlayersState.forEach((player, i) => {
-			if (game.private.seatedPlayers && game.private.seatedPlayers[i] && game.private.seatedPlayers[i].role) {
-				player.cardStatus.cardFront = 'secretrole';
-				player.cardStatus.cardBack = game.private.seatedPlayers[i].role;
-				player.cardStatus.cardDisplayed = true;
-				player.cardStatus.isFlipped = true;
-			}
-		});
-
-		game.general.status = 'Game is being remade..';
-		if (!game.summarySaved) {
-			const summary = game.private.summary.publish();
-			if (summary && summary.toObject() && game.general.uid !== 'devgame' && !game.general.private) {
-				summary.save();
-				game.summarySaved = true;
-			}
-		}
-		sendInProgressGameUpdate(game);
-
-		await new Promise(r => setTimeout(r, 3000));
-
-		game.publicPlayersState.forEach(player => {
-			if (remakePlayerNames.includes(player.userName)) player.leftGame = true;
-		});
-
-		if (game.publicPlayersState.filter(publicPlayer => publicPlayer.leftGame).length === game.general.playerCount) {
-			await games.remove(gameKey);
 		} else {
-			await games.set(gameKey, game);
-			sendInProgressGameUpdate(game);
-		}
-
-		const newGameKey = await games.register(newGame);
-		sendGameList();
-
-		let creatorRemade = false;
-		remakePlayerSocketIDs.forEach((id, index) => {
-			if (io.sockets.sockets[id]) {
-				io.sockets.sockets[id].leave(gameKey);
-				sendGameInfo(io.sockets.sockets[id], newGameKey);
-				if (
-					io.sockets.sockets[id] &&
-					io.sockets.sockets[id].handshake &&
-					io.sockets.sockets[id].handshake.session &&
-					io.sockets.sockets[id].handshake.session.passport
-				) {
-					updateSeatedUser(io.sockets.sockets[id], io.sockets.sockets[id].handshake.session.passport, { uid: newGameKey });
-					// handleUserLeaveGame(io.sockets.sockets[id], passport, game, {isSeated: true, isRemake: true});
-					if (io.sockets.sockets[id].handshake.session.passport.user === newGame.general.gameCreatorName) creatorRemade = true;
-				}
-			}
-
-		});
-		checkStartConditions(newGame);
-	};
-
-	/**
-	 * @param {string} firstTableUid - the UID of the first tournament table
-	 */
-	const cancellTourny = firstTableUid => {
-		const secondTableUid =
-			firstTableUid.charAt(firstTableUid.length - 1) === 'A'
-				? `${firstTableUid.slice(0, firstTableUid.length - 1)}B`
-				: `${firstTableUid.slice(0, firstTableUid.length - 1)}A`;
-		const secondTable = games.find(game => game.general.uid === secondTableUid);
-
-		if (secondTable) {
-			secondTable.general.tournyInfo.isCancelled = true;
-			secondTable.chats.push({
-				gameChat: true,
-				timestamp: new Date(),
-				chat: [
-					{
-						text: 'Due to the other tournament table voting for cancellation, this tournament has been cancelled.',
-						type: 'hitler'
-					}
-				]
+			/* Toggle remake on */
+			socket.emit('updateRemakeVoting', true);
+			await groups.add('remake', userKey, gameKey);
+			chat.chat.push({
+				text: ` has voted to remake this game. (${numRemake}/${numMinimumRemake})`
 			});
-			secondTable.general.status = 'Tournament has been cancelled.';
-			sendInProgressGameUpdate(secondTable);
 		}
-	};
 
-	if (!game || !player || !game.remakeData) {
-		return;
+		await checkRemakeConditions();
+
+		await games.writeChannel(gameKey, channels.GAME.PUBLIC, chat);
 	}
-
-	if (data.remakeStatus && Date.now() > player.remakeTime + 7000) {
-		player.isRemaking = true;
-		player.remakeTime = Date.now();
-
-		const remakePlayerCount = remakeData.filter(player => player.isRemaking).length;
-		chat.chat.push({
-			text: ` has voted to ${remakeText} this ${game.general.isTourny ? 'tournament.' : 'game.'} (${remakePlayerCount}/${minimumRemakeVoteCount})`
-		});
-
-		if (!game.general.isRemaking && publicPlayersState.length > 3 && remakePlayerCount >= minimumRemakeVoteCount) {
-			game.general.isRemaking = true;
-			game.general.remakeCount = 5;
-
-			game.private.remakeTimer = interval(async () => {
-				if (game.general.remakeCount !== 0) {
-					game.general.status = `Game is ${game.general.isTourny ? 'cancelled ' : 'remade'} in ${game.general.remakeCount} ${
-						game.general.remakeCount === 1 ? 'second' : 'seconds'
-					}.`;
-					game.general.remakeCount--;
-				} else {
-					clearInterval(game.private.remakeTimer);
-					game.general.status = `Game has been ${game.general.isTourny ? 'cancelled' : 'remade'}.`;
-					game.general.isRemade = true;
-					if (game.general.isTourny) {
-						cancellTourny(gameKey);
-					} else {
-						await makeNewGame();
-					}
-				}
-				sendInProgressGameUpdate(game);
-			}, 1000);
-		}
-	} else if (!data.remakeStatus && Date.now() > player.remakeTime + 2000) {
-		player.isRemaking = false;
-		player.remakeTime = Date.now();
-
-		const remakePlayerCount = remakeData.filter(player => player.isRemaking).length;
-
-		if (game.general.isRemaking && remakePlayerCount < minimumRemakeVoteCount) {
-			game.general.isRemaking = false;
-			game.general.status = 'Game remaking has been cancelled.';
-			clearInterval(game.private.remakeTimer);
-		}
-		chat.chat.push({
-			text: ` has rescinded their vote to ${
-				game.general.isTourny ? 'cancel this tournament.' : 'remake this game.'
-			} (${remakePlayerCount}/${minimumRemakeVoteCount})`
-		});
-	} else {
-		return;
-	}
-	socket.emit('updateRemakeVoting', player.isRemaking);
-	game.chats.push(chat);
-	sendInProgressGameUpdate(game);
 };
 
 /**
@@ -1724,617 +547,77 @@ module.exports.handleUpdatedRemakeGame = (socket, userKey, gameKey, data) => {
  * @param {string} gameKey - A game cache key
  * @param {Object} data - A message payload
  */
-module.exports.handleAddNewGameChat = (socket, userKey, gameKey, data) => {
-	if (!data.chat || !chat.length || chat.length > 300) return;
+module.exports.handleAddNewGameChat = async (socket, userKey, gameKey, data) => {
+	if (!data.chat || !data.chat.length || data.chat.length > 300) return;
 	const chat = data.chat.trim();
 
-	const playerIndex = game.publicPlayersState.findIndex(player => player.userName === userKey);
-	const { publicPlayersState } = game;
-	const player = publicPlayersState.find(player => player.userName === passport.user);
+	const isAEM = await isStandardAEM(userKey);
 
-	const user = userList.find(u => passport.user === u.userName);
+	const { stage, phase, president, chancellor, electionCount} =
+		await games.getState(gameKey, 'stage', 'phase', 'president', 'chancellor', 'messageTimeout', 'electionCount');
+	const { name, isCasual } =
+		await games.getConfig(gameKey, 'name', 'isCasual', 'disableChat', 'disableObserver');
+	const isPlayer = await groups.isMember('players', userKey, gameKey);
+	const isDead = await groups.isMember('dead', userKey, gameKey);
+	const { wins, losses } = await userInfo.get(userKey);
 
-	if (!user || !user.userName) {
-		return;
-	}
-	const AEM = staffUserNames.includes(passport.user) || newStaff.modUserNames.includes(passport.user) || newStaff.editorUserNames.includes(passport.user);
+	if (isAEM) {
+		/* Handle AEM chat */
+		await games.writeChannel(gameKey, channels.CHAT.PLAYER, {
+			timestamp: new Date(),
+			userName: gameKey,
+			chat: data.chat,
+			staffRole: await getStaffRole(userKey)
+		});
 
-	// if (!AEM && game.general.disableChat) return;
-	if (!(AEM && playerIndex === -1)) {
-		if (game.general.disableChat && !game.gameState.isCompleted && game.gameState.isStarted && playerIndex !== -1) {
-			return;
-		}
-		if (game.general.disableObserver && playerIndex === -1) {
-			return;
-		}
-	}
-
-	data.userName = passport.user;
-
-	if (
-		game &&
-		game.private &&
-		game.private.seatedPlayers &&
-		game.private.seatedPlayers[playerIndex] &&
-		game.private.seatedPlayers[playerIndex].playersState &&
-		game.private.seatedPlayers[playerIndex].playersState[playerIndex] &&
-		game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim
+	} else if (
+		isPlayer
+		&& (stage !== stages.PLAYING || !isDead)
+		&& (stage !== stages.PLAYING || (phase === 'presidentSelectingPolicy' && userKey === president))
+		&& (stage !== stages.PLAYING || (phase === 'chancellorSelectingPolicy' && userKey === chancellor))
 	) {
-		if (/^[RB]{2,3}$/i.exec(chat)) {
-			const formattedChat = chat
-				.toLowerCase()
-				.split('')
-				.sort()
-				.reverse()
-				.join('');
+		/* Handle player chat */
+		await games.writeChannel(gameKey, channels.CHAT.PLAYER, {
+			timestamp: new Date(),
+			userName: gameKey,
+			chat: data.chat
+		});
 
-			// console.log(chat, ' - ', formattedChat, ' - ', game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim);
-
-			if (chat.length === 3 && 0 <= playerIndex <= 9 && game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'wasPresident') {
-				const claimData = {
-					userName: user.userName,
-					claimState: formattedChat,
-					claim: game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim,
-					uid: data.uid
-				};
-				if (addNewClaim(socket, passport, game, claimData)) return;
-			}
-
-			if (chat.length === 2 && 0 <= playerIndex <= 9 && game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'wasChancellor') {
-				const claimData = {
-					userName: user.userName,
-					claimState: formattedChat,
-					claim: game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim,
-					uid: data.uid
-				};
-				if (addNewClaim(socket, passport, game, claimData)) return;
-			}
-
-			if (chat.length === 3 && 0 <= playerIndex <= 9 && game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'didPolicyPeek') {
-				const claimData = {
-					userName: user.userName,
-					claimState: chat,
-					claim: game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim,
-					uid: data.uid
-				};
-				if (addNewClaim(socket, passport, game, claimData)) return;
-			}
-		}
-
-		if (/^(b|blue|l|lib|liberal)$/i.exec(chat)) {
-			// console.log(chat, ' - ', 'liberal', ' - ', game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim);
-			if (
-				0 <= playerIndex <= 9 &&
-				(game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'didSinglePolicyPeek' ||
-					game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'didInvestigateLoyalty')
-			) {
-				const claimData = {
-					userName: user.userName,
-					claimState: 'liberal',
-					claim: game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim,
-					uid: data.uid
-				};
-				if (addNewClaim(socket, passport, game, claimData)) return;
-			}
-		}
-
-		if (/^(r|red|fas|f|fasc|fascist)$/i.exec(chat)) {
-			// console.log(chat, ' - ', 'fascist', ' - ', game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim);
-			if (
-				0 <= playerIndex <= 9 &&
-				(game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'didSinglePolicyPeek' ||
-					game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim === 'didInvestigateLoyalty')
-			) {
-				const claimData = {
-					userName: user.userName,
-					claimState: 'fascist',
-					claim: game.private.seatedPlayers[playerIndex].playersState[playerIndex].claim,
-					uid: data.uid
-				};
-				if (addNewClaim(socket, passport, game, claimData)) return;
-			}
-		}
-	}
-
-	if (!AEM) {
-		if (player) {
-			if ((player.isDead && !game.gameState.isCompleted) || player.leftGame) {
-				return;
-			}
-		} else {
-			if (game.general.private && !game.general.whitelistedPlayers.includes(passport.user)) {
-				return;
-			}
-			if (game.general.disableObserver || user.wins + user.losses < 11) {
-				return;
-			}
-		}
-	}
-
-	const { gameState } = game;
-
-	if (
-		player &&
-		(gameState.phase === 'presidentSelectingPolicy' || gameState.phase === 'chancellorSelectingPolicy') &&
-		(publicPlayersState.find(play => play.userName === player.userName).governmentStatus === 'isPresident' ||
-			publicPlayersState.find(play => play.userName === player.userName).governmentStatus === 'isChancellor')
-	) {
-		return;
-	}
-
-	data.timestamp = new Date();
-	if (AEM) {
-		const { blindMode, replacementNames } = game.general;
-
-		const aemRigdeck = /^\/forcerigdeck (.*)$/i.exec(chat);
-		if (aemRigdeck) {
-			if (game && game.private) {
-				const deck = aemRigdeck[0].split(' ')[1];
-				if (/^([RB]{1,27})$/i.exec(deck)) {
-					if (deck.length > 27 || deck.length === 0) {
-						socket.emit('sendAlert', 'This deck is too big (or too small).');
-						return;
-					}
-
-					const changedChat = [
-						{
-							text: 'An AEM member has changed the deck to '
-						}
-					];
-
-					for (card of deck) {
-						card = card.toUpperCase();
-						if (card === 'R' || card === 'B') {
-							changedChat.push({
-								text: card,
-								type: `${card === 'R' ? 'fascist' : 'liberal'}`
-							});
-						}
-					}
-
-					changedChat.push({
-						text: '.'
-					});
-
-					game.chats.push({
-						gameChat: true,
-						timestamp: new Date(),
-						chat: changedChat
-					});
-
-					sendPlayerChatUpdate(game, data);
-					sendInProgressGameUpdate(game, false);
-				} else {
-					socket.emit('sendAlert', 'This is not a valid deck.');
-					return;
-				}
-			} else {
-				socket.emit('sendAlert', 'The game has not started yet.');
-			}
-			return;
-		}
-
-		const aemForce = /^\/forcevote (\d{1,2}) (ya|ja|nein|yes|no|true|false)$/i.exec(chat);
-		if (aemForce) {
-			if (player) {
-				socket.emit('sendAlert', 'You cannot force a vote whilst playing.');
-				return;
-			}
-			if (game.general.isRemade) {
-				socket.emit('sendAlert', 'This game has been remade.');
-				return;
-			}
-			const affectedPlayerNumber = parseInt(aemForce[1]) - 1;
-			const voteString = aemForce[2].toLowerCase();
-			if (game && game.private && game.private.seatedPlayers) {
-				const affectedPlayer = game.private.seatedPlayers[affectedPlayerNumber];
-				if (!affectedPlayer) {
-					socket.emit('sendAlert', `There is no seat {${affectedPlayerNumber + 1}}.`);
-					return;
-				}
-				let vote = false;
-				if (voteString == 'ya' || voteString == 'ja' || voteString == 'yes' || voteString == 'true') vote = true;
-
-				if (affectedPlayer.voteStatus.hasVoted) {
-					socket.emit(
-						'sendAlert',
-						`${affectedPlayer.userName} {${affectedPlayerNumber + 1}} has already voted.\nThey were voting: ${
-							affectedPlayer.voteStatus.didVoteYes ? 'ja' : 'nein'
-						}\nYou have set them to vote: ${vote ? 'ja' : 'nein'}
-						`
-					);
-				}
-
-				game.chats.push({
-					gameChat: true,
-					timestamp: new Date(),
-					chat: [
-						{
-							text: 'An AEM member has forced '
-						},
-						{
-							text: blindMode
-								? `${replacementNames[affectedPlayerNumber]} {${affectedPlayerNumber + 1}} `
-								: `${affectedPlayer.userName} {${affectedPlayerNumber + 1}}`,
-							type: 'player'
-						},
-						{
-							text: ' to vote '
-						},
-						{
-							text: `${vote ? 'ja' : 'nein'}`,
-							type: 'player'
-						},
-						{
-							text: '.'
-						}
-					]
-				});
-				selectVoting({ user: affectedPlayer.userName }, game, { vote }, null, true);
-				sendPlayerChatUpdate(game, data);
-				sendInProgressGameUpdate(game, false);
-			} else {
-				socket.emit('sendAlert', 'The game has not started yet.');
-			}
-			return;
-		}
-
-		const aemSkip = /^\/forceskip (\d{1,2})$/i.exec(chat);
-		if (aemSkip) {
-			if (player) {
-				socket.emit('sendAlert', 'You cannot force skip a government whilst playing.');
-				return;
-			}
-			if (game.general.isRemade) {
-				socket.emit('sendAlert', 'This game has been remade.');
-				return;
-			}
-			const affectedPlayerNumber = parseInt(aemSkip[1]) - 1;
-			if (game && game.private && game.private.seatedPlayers) {
-				const affectedPlayer = game.private.seatedPlayers[affectedPlayerNumber];
-				if (!affectedPlayer) {
-					socket.emit('sendAlert', `There is no seat ${affectedPlayerNumber + 1}.`);
-					return;
-				}
-				if (affectedPlayerNumber !== game.gameState.presidentIndex) {
-					socket.emit('sendAlert', `The player in seat ${affectedPlayerNumber + 1} is not president.`);
-					return;
-				}
-				let chancellor = -1;
-				const currentPlayers = [];
-				for (let i = 0; i < game.private.seatedPlayers.length; i++) {
-					currentPlayers[i] = !(
-						game.private.seatedPlayers[i].isDead ||
-						(i === game.gameState.previousElectedGovernment[0] && game.general.livingPlayerCount > 5) ||
-						i === game.gameState.previousElectedGovernment[1]
-					);
-				}
-				currentPlayers[affectedPlayerNumber] = false;
-				let counter = affectedPlayerNumber + 1;
-				while (chancellor === -1) {
-					if (counter >= currentPlayers.length) {
-						counter = 0;
-					}
-					if (currentPlayers[counter]) {
-						chancellor = counter;
-					}
-					counter++;
-				}
-
-				game.chats.push({
-					gameChat: true,
-					timestamp: new Date(),
-					chat: [
-						{
-							text: 'An AEM member has force skipped the government with '
-						},
-						{
-							text: blindMode
-								? `${replacementNames[affectedPlayerNumber]} {${affectedPlayerNumber + 1}} `
-								: `${affectedPlayer.userName} {${affectedPlayerNumber + 1}}`,
-							type: 'player'
-						},
-						{
-							text: ' as president.'
-						}
-					]
-				});
-				selectChancellor(null, { user: affectedPlayer.userName }, game, { chancellorIndex: chancellor }, true);
-				setTimeout(() => {
-					for (const p of game.private.seatedPlayers.filter(player => !player.isDead)) {
-						selectVoting({ user: p.userName }, game, { vote: false }, null, true);
-					}
-				}, 1000);
-				sendPlayerChatUpdate(game, data);
-				sendInProgressGameUpdate(game, false);
-			} else {
-				socket.emit('sendAlert', 'The game has not started yet.');
-			}
-			return;
-		}
-
-		const aemPick = /^\/forcepick (\d{1,2}) (\d{1,2})$/i.exec(chat);
-		if (aemPick) {
-			if (player) {
-				socket.emit('sendAlert', 'You cannot force a pick whilst playing.');
-				return;
-			}
-			if (game.general.isRemade) {
-				socket.emit('sendAlert', 'This game has been remade.');
-				return;
-			}
-			const affectedPlayerNumber = parseInt(aemPick[1]) - 1;
-			const chancellorPick = aemPick[2];
-			if (game && game.private && game.private.seatedPlayers) {
-				const affectedPlayer = game.private.seatedPlayers[affectedPlayerNumber];
-				const affectedChancellor = game.private.seatedPlayers[chancellorPick - 1];
-				if (!affectedPlayer) {
-					socket.emit('sendAlert', `There is no seat ${affectedPlayerNumber + 1}.`);
-					return;
-				}
-				if (!affectedChancellor) {
-					socket.emit('sendAlert', `There is no seat ${chancellorPick}.`);
-					return;
-				}
-				if (affectedPlayerNumber !== game.gameState.presidentIndex) {
-					socket.emit('sendAlert', `The player in seat ${affectedPlayerNumber + 1} is not president.`);
-					return;
-				}
-				if (
-					game.publicPlayersState[chancellorPick - 1].isDead ||
-					chancellorPick - 1 === affectedPlayerNumber ||
-					chancellorPick - 1 === game.gameState.previousElectedGovernment[1] ||
-					(chancellorPick - 1 === game.gameState.previousElectedGovernment[0] && game.general.livingPlayerCount > 5)
-				) {
-					socket.emit('sendAlert', `The player in seat ${chancellorPick} is not a valid chancellor. (Dead or TL)`);
-					return;
-				}
-
-				game.chats.push({
-					gameChat: true,
-					timestamp: new Date(),
-					chat: [
-						{
-							text: 'An AEM member has forced '
-						},
-						{
-							text: blindMode
-								? `${replacementNames[affectedPlayerNumber]} {${affectedPlayerNumber + 1}} `
-								: `${affectedPlayer.userName} {${affectedPlayerNumber + 1}}`,
-							type: 'player'
-						},
-						{
-							text: ' to pick '
-						},
-						{
-							text: blindMode ? `${replacementNames[chancellorPick - 1]} {${chancellorPick}} ` : `${affectedChancellor.userName} {${chancellorPick}}`,
-							type: 'player'
-						},
-						{
-							text: ' as chancellor.'
-						}
-					]
-				});
-				selectChancellor(null, { user: affectedPlayer.userName }, game, { chancellorIndex: chancellorPick - 1 }, true);
-				sendPlayerChatUpdate(game, data);
-				sendInProgressGameUpdate(game, false);
-			} else {
-				socket.emit('sendAlert', 'The game has not started yet.');
-			}
-			return;
-		}
-
-		const aemPing = /^\/forceping (\d{1,2})$/i.exec(chat);
-		if (aemPing) {
-			if (player) {
-				socket.emit('sendAlert', 'You cannot force a ping whilst playing.');
-				return;
-			}
-			if (game.general.isRemade) {
-				socket.emit('sendAlert', 'This game has been remade.');
-				return;
-			}
-			const affectedPlayerNumber = parseInt(aemPing[1]) - 1;
-			if (game && game.private && game.private.seatedPlayers) {
-				const affectedPlayer = game.private.seatedPlayers[affectedPlayerNumber];
-				if (!affectedPlayer) {
-					socket.emit('sendAlert', `There is no seat ${affectedPlayerNumber + 1}.`);
-					return;
-				}
-
-				game.chats.push({
-					gameChat: true,
-					timestamp: new Date(),
-					chat: [
-						{
-							text: 'An AEM member has pinged '
-						},
-						{
-							text: blindMode
-								? `${replacementNames[affectedPlayerNumber]} {${affectedPlayerNumber + 1}} `
-								: `${affectedPlayer.userName} {${affectedPlayerNumber + 1}}`,
-							type: 'player'
-						},
-						{
-							text: '.'
-						}
-					]
-				});
-
-				try {
-					const affectedSocketId = Object.keys(io.sockets.sockets).find(
-						socketId =>
-							io.sockets.sockets[socketId].handshake.session.passport &&
-							io.sockets.sockets[socketId].handshake.session.passport.user === game.publicPlayersState[affectedPlayerNumber].userName
-					);
-					if (!io.sockets.sockets[affectedSocketId]) {
-						socket.emit('sendAlert', 'Unable to send ping.');
-						return;
-					}
-					io.sockets.sockets[affectedSocketId].emit('pingPlayer', 'Secret Hitler IO: A moderator has pinged you.');
-				} catch (e) {
-					console.log(e, 'caught exception in ping chat');
-				}
-				sendPlayerChatUpdate(game, data);
-				sendInProgressGameUpdate(game, false);
-			} else {
-				socket.emit('sendAlert', 'The game has not started yet.');
-				return;
-			}
-			return;
-		}
-	}
-
-	const pingMods = /^@(mod|moderator|editor|aem|mods) (.*)$/i.exec(chat);
-
-	if (pingMods && player) {
-		if (!game.lastModPing || Date.now() > game.lastModPing + 180000) {
-			game.lastModPing = Date.now();
-			sendInProgressGameUpdate(game, false);
-			makeReport(
-				{
-					player: passport.user,
-					situation: `"${pingMods[2]}".`,
-					election: game.general.electionCount,
-					title: game.general.name,
-					uid: game.general.uid,
-					gameType: game.general.casualGame ? 'Casual' : 'Ranked'
-				},
-				game,
-				'ping'
-			);
-		} else {
-			socket.emit('sendAlert', `You can't ping mods for another ${(game.lastModPing + 180000 - Date.now()) / 1000} seconds.`);
-		}
-		return;
-	}
-
-	for (repl of chatReplacements) {
-		const replace = repl.regex.exec(chat);
-		if (replace) {
-			if (AEM) {
-				if (game.general.chatReplTime[repl.id] === 0 || Date.now() > game.general.chatReplTime[repl.id] + repl.aemCooldown * 1000) {
-					data.chat = repl.replacement;
-					game.general.chatReplTime[repl.id] = game.general.chatReplTime[0] = Date.now();
-				} else {
-					socket.emit(
-						'sendAlert',
-						`You can do this command again in ${((game.general.chatReplTime[repl.id] + repl.aemCooldown * 1000 - Date.now()) / 1000).toFixed(2)} seconds.`
-					);
-					return;
-				}
-			} else if (user.wins + user.losses > repl.normalGames) {
-				if (
-					Date.now() > game.general.chatReplTime[0] + 30000 &&
-					(game.general.chatReplTime[repl.id] === 0 || Date.now() > game.general.chatReplTime[repl.id] + repl.normalCooldown * 1000)
-				) {
-					data.chat = repl.replacement;
-					game.general.chatReplTime[repl.id] = game.general.chatReplTime[0] = Date.now();
-				} else {
-					socket.emit(
-						'sendAlert',
-						`You can't do this right now, try again in ${Math.max(
-							(game.general.chatReplTime[0] + 30000 - Date.now()) / 1000,
-							(game.general.chatReplTime[repl.id] + repl.normalCooldown * 1000 - Date.now()) / 1000
-						).toFixed(2)} seconds.`
-					);
-					return;
-				}
-			}
-		}
-	}
-
-	const pinged = /^Ping(\d{1,2})/i.exec(chat);
-
-	if (
-		pinged &&
-		player &&
-		game.gameState.isStarted &&
-		parseInt(pinged[1]) <= game.publicPlayersState.length &&
-		(!player.pingTime || Date.now() - player.pingTime > 180000)
-	) {
-		try {
-			const affectedPlayerNumber = parseInt(pinged[1]) - 1;
-			const affectedSocketId = Object.keys(io.sockets.sockets).find(
-				socketId =>
-					io.sockets.sockets[socketId].handshake.session.passport &&
-					io.sockets.sockets[socketId].handshake.session.passport.user === game.publicPlayersState[affectedPlayerNumber].userName
-			);
-
-			player.pingTime = Date.now();
-			if (!io.sockets.sockets[affectedSocketId]) {
-				return;
-			}
-			io.sockets.sockets[affectedSocketId].emit(
-				'pingPlayer',
-				game.general.blindMode ? 'Secret Hitler IO: A player has pinged you.' : `Secret Hitler IO: Player ${data.userName} just pinged you.`
-			);
-
-			game.chats.push({
-				gameChat: true,
-				userName: passport.user,
-				timestamp: new Date(),
-				chat: [
+		/* Ping the mods if necessary (possible locking operation) */
+		const pingMods = /^@(mod|moderator|editor|aem|mods) (.*)$/i.exec(chat);
+		if (pingMods && userKey != null ) {
+			const release = await games.acquire(gameKey);
+			const { lastModPing } = games.getState(gameKey, 'lastModPing');
+			if (lastModPing != null && now > lastModPing + 180000) {
+				await games.setState(gameKey, { lastModPing: now });
+				makeReport(
 					{
-						text: game.general.blindMode
-							? `A player has pinged player number ${affectedPlayerNumber + 1}.`
-							: `${passport.user} has pinged ${publicPlayersState[affectedPlayerNumber].userName} (${affectedPlayerNumber + 1}).`
-					}
-				],
-				previousSeasonAward: user.previousSeasonAward,
-				uid: data.uid,
-				inProgress: game.gameState.isStarted
-			});
-			sendInProgressGameUpdate(game);
-		} catch (e) {
-			console.log(e, 'caught exception in ping chat');
-		}
-	} else if (!pinged) {
-		const lastMessage = game.chats
-			.filter(chat => !chat.gameChat && typeof chat.chat === 'string' && chat.userName === user.userName)
-			.reduce(
-				(acc, cur) => {
-					return acc.timestamp > cur.timestamp ? acc : cur;
-				},
-				{ timestamp: new Date(0) }
-			);
-
-		if (lastMessage.chat) {
-			let leniancy; // How much time (in seconds) must pass before allowing the message.
-			if (lastMessage.chat.toLowerCase() === data.chat.toLowerCase()) leniancy = 1.5;
-			else leniancy = 0.25;
-
-			const timeSince = data.timestamp - lastMessage.timestamp;
-			if (!AEM && timeSince < leniancy * 1000) return; // Prior chat was too recent.
-		}
-
-		data.staffRole = (() => {
-			if (modUserNames.includes(passport.user) || newStaff.modUserNames.includes(passport.user)) {
-				return 'moderator';
-			} else if (editorUserNames.includes(passport.user) || newStaff.editorUserNames.includes(passport.user)) {
-				return 'editor';
-			} else if (adminUserNames.includes(passport.user)) {
-				return 'admin';
+						player: userKey,
+						situation: `"${pingMods[2]}".`,
+						election: electionCount,
+						title: name,
+						uid: gameKey,
+						gameType: isCasual ? 'Casual' : 'Ranked'
+					},
+					gameKey,
+					'ping'
+				);
+			} else {
+				socket.emit('sendAlert', `You can't ping mods for another ${(game.lastModPing + 180000 - Date.now()) / 1000} seconds.`);
 			}
-		})();
-		if (AEM && user.staffIncognito) {
-			data.hiddenUsername = data.userName;
-			data.staffRole = 'moderator';
-			data.userName = 'Incognito';
+			release();
 		}
-		
-		// Attempts to cut down on overloading server resources
-		if (game.general.private && game.chats.length >= 30) {
-			game.chats = game.chats.slice(game.chats.length - 30, game.chats.length);
-		}
-		
-		game.chats.push(data);
 
-		if (game.gameState.isTracksFlipped) {
-			sendPlayerChatUpdate(game, data);
-		} else {
-			io.in(data.uid).emit('gameUpdate', secureGame(game));
-		}
+	} else if (
+		!isPlayer
+		&& wins + losses >= 10
+	) {
+		/* Handle observer chat */
+		await games.writeChannel(gameKey, channels.CHAT.OBSERVER, {
+			timestamp: new Date(),
+			userName: gameKey,
+			chat: data.chat
+		});
 	}
 };
 
@@ -2344,37 +627,17 @@ module.exports.handleAddNewGameChat = (socket, userKey, gameKey, data) => {
  * @param {object} data - Socket data
  */
 module.exports.handleUpdateWhitelist = async (userKey, gameKey, data) => {
-	const game = await games.get(gameKey);
 
-	const isPrivateSafe =
-		!game.general.private
-		|| (game.general.private && (data.password === game.private.privatePassword || game.general.whitelistedPlayers.includes(userKey)));
+	release = games.acquire(gameKey);
+	const { isPrivate, password, whitelist, gameCreatorName } = await games.getConfig(gameKey, 'isPrivate', 'password', 'whitelist');
+
+	const isPrivateSafe = !isPrivate || (isPrivate && (data.password === password || whitelist.includes(userKey)));
 
 	// Only update the whitelist if whitelistsed, has password, or is the creator
-	if (isPrivateSafe || game.general.gameCreatorName === userKey) {
-		game.general.whitelistedPlayers = data.whitelistPlayers;
-		games.set(gameKey, game);
-		io.in(data.uid).emit('gameUpdate', secureGame(game));
+	if (isPrivateSafe || gameCreatorName === userKey) {
+		await games.setConfig(gameKey, {whitelist:  data.whitelistPlayers});
 	}
-};
-
-/**
- * Turns a list of groups into a single staff role.
- * (For legacy db support)
- *
- * @param {string} userKey - A user cache key
- * @return {string}
- */
-const getStaffRole = async userKey => {
-	const groups = await groups.ofMember(userKey);
-	if (groups.includes('moderator')) {
-		return 'moderator';
-	} else if (groups.includes('editor')) {
-		return 'editor';
-	} else if (groups.includes('admin')) {
-		return 'admin';
-	}
-	return '';
+	release()
 };
 
 /**
@@ -2383,224 +646,121 @@ const getStaffRole = async userKey => {
  * @param {object} data - Message payload
  */
 module.exports.handleNewGeneralChat = async (socket, userKey, data) => {
-	if (await userInfo.get(userKey, 'isPrivate')) return;
-
-	const chat = (data.chat = data.chat.trim());
 	if (!data.chat.length || data.chat.length > 300) return;
 
 	const isAEM = await isStandardAEM(userKey);
 
-  const leniancy = 0.5;
+	const leniancy = 0.5;
 	const timeSince = await genChat.timeSinceLast();
 	if (timeSince < leniancy * 1000) return; // Prior chat was too recent.
 
-	const gameTotal = await userInfo.get(userKey, 'wins') + await userInfo.get(userKey, 'losses');
+	const { wins, losses } = await userInfo.get(userKey, 'wins', 'losses');
+	const gameTotal = wins + losses;
 
-	for (const repl of chatReplacements) {
-		const replace = repl.regex.exec(chat);
-		if (replace) {
-			if (isAEM) {
-				if (generalChatReplTime[repl.id] === 0 || Date.now() > generalChatReplTime[repl.id] + repl.aemCooldown * 1000) {
-					data.chat = repl.replacement;
-					generalChatReplTime[repl.id] = generalChatReplTime[0] = Date.now();
-				} else {
-					socket.emit(
-						'sendAlert',
-						`You can do this command again in ${((generalChatReplTime[repl.id] + repl.aemCooldown * 1000 - Date.now()) / 1000).toFixed(2)} seconds.`
-					);
-					return;
-				}
-			} else if (gameTotal > repl.normalGames) {
-				if (
-					Date.now() > generalChatReplTime[0] + 30000 &&
-					(generalChatReplTime[repl.id] === 0 || Date.now() > generalChatReplTime[repl.id] + repl.normalCooldown * 1000)
-				) {
-					data.chat = repl.replacement;
-					generalChatReplTime[repl.id] = generalChatReplTime[0] = Date.now();
-				} else {
-					socket.emit(
-						'sendAlert',
-						`You can't do this right now, try again in ${Math.max(
-							(generalChatReplTime[0] + 30000 - Date.now()) / 1000,
-							(generalChatReplTime[repl.id] + repl.normalCooldown * 1000 - Date.now()) / 1000
-						).toFixed(2)} seconds.`
-					);
-					return;
-				}
-			}
-		}
-	}
-
-	if (gameTotal >= 10) {
+	if (gameTotal >= 10 || isAEM) {
 		const newChat = {
 			time: new Date(),
-			chat: data.chat,
+			chat: data.chat.trim(),
 			userName: userKey,
 			staffRole: await getStaffRole(userKey)
 		};
-		if (isAEM && await userInfo.get(userKey, 'staffIncognito')) {
+		const { staffIncognito } = await userInfo.get(userKey, 'staffIncognito');
+		if (isAEM && staffIncognito ) {
 			newChat.hiddenUsername = newChat.userName;
 			newChat.staffRole = 'moderator';
 			newChat.userName = 'Incognito';
 		}
 		await genChat.push(newChat);
-		await sendGeneralChats(socket);
+		const history = await genChat.get();
+		socket.emit('generalChats', history);
 	}
-};
-
-/**
- * @param {object} socket - A socket reference
- * @param {string} userKey - A user cache key
- * @param {object} data - Message payload
- */
-module.exports.handleUpdatedGameSettings = async (socket, userKey, data) => {
-
-	/* broken, needs a fix*/
-
 };
 
 /**
  * @param {object} socket - socket reference.
- * @param {object} passport - socket authentication.
- * @param {object} game - game reference.
+ * @param {string} userKey - socket authentication.
+ * @param {string} gameKey - game reference.
  */
-module.exports.handleSubscribeModChat = (socket, passport, game) => {
-	// Authentication Assured in routes.js
+module.exports.handleGameFreeze = async (socket, userKey, gameKey) => {
 
-	if (game.private.hiddenInfoSubscriptions.includes(passport.user)) return;
-
-	if (game.private.hiddenInfoShouldNotify) {
-		makeReport(
-			{
-				player: passport.user,
-				situation: `has subscribed to mod chat for a game without an auto-report.`,
-				election: game.general.electionCount,
-				title: game.general.name,
-				uid: game.general.uid,
-				gameType: game.general.casualGame ? 'Casual' : 'Ranked'
-			},
-			game,
-			'modchat'
-		);
-		game.private.hiddenInfoShouldNotify = false;
+	if (await groups.isMember('players', userKey, gameKey)) {
+		socket.emit('sendAlert', 'You cannot freeze the game whilst playing.');
+		return;
 	}
 
-	const modOnlyChat = {
-		timestamp: new Date(),
-		gameChat: true,
-		chat: [{ text: `${passport.user} has subscribed to mod chat. Current deck: ` }]
-	};
-	game.private.policies.forEach(policy => {
-		modOnlyChat.chat.push({
-			text: policy === 'liberal' ? 'B' : 'R',
-			type: policy
-		});
-	});
-	game.private.hiddenInfoChat.push(modOnlyChat);
-	game.private.hiddenInfoSubscriptions.push(passport.user);
-	sendInProgressGameUpdate(game);
-};
-
-/**
- * @param {object} socket - socket reference.
- * @param {object} passport - socket authentication.
- * @param {object} game - game reference.
- * @param {string} modUserName - freezing Moderator's username
- */
-module.exports.handleGameFreeze = (socket, passport, game, modUserName) => {
-	const gameToFreeze = game;
-
-	if (gameToFreeze && gameToFreeze.private && gameToFreeze.private.seatedPlayers) {
-		for (player of gameToFreeze.private.seatedPlayers) {
-			if (modUserName === player.userName) {
-				socket.emit('sendAlert', 'You cannot freeze the game whilst playing.');
-				return;
-			}
-		}
-	}
-
-	if (!game.private.gameFrozen) {
+	let msg;
+	if (await gameSets.isMember('frozen', gameKey)) {
+		await gameSets.remove('frozen', gameKey);
+		msg = 'unfrozen';
+	} else {
 		const modaction = new ModAction({
 			date: new Date(),
-			modUserName: passport.user,
-			userActedOn: game.general.uid,
+			modUserName: userKey,
+			userActedOn: gameKey,
 			modNotes: '',
 			actionTaken: 'Game Freeze'
 		});
 		modaction.save();
-		game.private.gameFrozen = true;
+		await gameSets.add('frozen', gameKey);
+		msg = 'frozen';
 	}
 
-	const now = new Date();
-	if (game.gameState.isGameFrozen) {
-		if (now - game.gameState.isGameFrozen >= 4000) {
-			game.gameState.isGameFrozen = false;
-		} else {
-			// Figured this would get annoying - can add it back if mods want.
-			// socket.emit('sendAlert', `You cannot do this yet, please wait ${Math.ceil((now - game.gameState.isGameFrozen) / 1000)} seconds`);
-			return;
-		}
-	} else {
-		game.gameState.isGameFrozen = now;
-	}
-
-	gameToFreeze.chats.push({
-		userName: `(AEM) ${modUserName}`,
-		chat: `has ${game.gameState.isGameFrozen ? 'frozen' : 'unfrozen'} the game. ${game.gameState.isGameFrozen ? 'All actions are prevented.' : ''}`,
-		isBroadcast: true,
+	await games.writeChannel(gameKey, channels.GAME.PUBLIC, {
+		chat: `(AEM) ${userKey} has ${msg} the game. ${game.gameState.isGameFrozen ? 'All actions are prevented.' : ''}`,
 		timestamp: new Date()
 	});
-
-	sendInProgressGameUpdate(game);
 };
 
 /**
- * @param {object} socket - socket reference.
- * @param {object} passport - socket authentication.
- * @param {object} game - game reference.
- * @param {string} modUserName - requesting Moderator's username
+ * @param {object} socket - Socket reference
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
  */
-module.exports.handleModPeekVotes = (socket, passport, game, modUserName) => {
-	const gameToPeek = game;
-	let output = '';
+module.exports.handleModPeekVotes = async (socket, userKey, gameKey) => {
 
-	if (gameToPeek && gameToPeek.private && gameToPeek.private.seatedPlayers) {
-		for (player of gameToPeek.private.seatedPlayers) {
-			if (modUserName === player.userName) {
-				socket.emit('sendAlert', 'You cannot peek votes whilst playing.');
-				return;
-			}
-		}
+	if (await groups.isMember('players', userKey, gameKey)) {
+		socket.emit('sendAlert', 'You cannot peek votes whilst playing.');
+		return;
 	}
 
-	if (!game.private.votesPeeked) {
-		const modaction = new ModAction({
+	if (!await gameSets.isMember('peaked', gameKey)) {
+		await gameSets.add('peaked', gameKey);
+		new ModAction({
 			date: new Date(),
-			modUserName: passport.user,
-			userActedOn: game.general.uid,
+			modUserName: userKey,
+			userActedOn: gameKey,
 			modNotes: '',
 			actionTaken: 'Peek Votes'
-		});
-		modaction.save();
-		game.private.votesPeeked = true;
+		}).save();
 	}
 
-	if (gameToPeek && gameToPeek.private && gameToPeek.private.seatedPlayers) {
-		const playersToCheckVotes = gameToPeek.private.seatedPlayers;
-		playersToCheckVotes.map(player => {
-			output += 'Seat ' + (playersToCheckVotes.indexOf(player) + 1) + ' - ';
-			if (player && player.role && player.role.cardName) {
-				if (player.role.cardName === 'hitler') {
-					output += player.role.cardName.substring(0, 1).toUpperCase() + player.role.cardName.substring(1) + '   - ';
-				} else {
-					output += player.role.cardName.substring(0, 1).toUpperCase() + player.role.cardName.substring(1) + ' - ';
-				}
-			} else {
-				output += 'Roles not Dealt - ';
-			}
-			output += player.isDead ? 'Dead' : player.voteStatus && player.voteStatus.hasVoted ? (player.voteStatus.didVoteYes ? 'Ja' : 'Nein') : 'Not' + ' Voted';
-			output += '\n';
-		});
+	const { seats } = await games.getState(gameKey, 'seats', 'hitler');
+	let output = "";
+	for (const playerKey of await groups.members('players', gameKey)) {
+		output += `Seat ${seats.indexOf(playerKey) + 1} - `;
+
+		const playerGroups = await groups.ofMember(playerKey, gameKey);
+
+		if ('hitler' in playerGroups) {
+			output += 'Hitler   - ';
+		} else if ('fascist' in playerGroups) {
+			output += 'Fascist  - ';
+		} else if ('liberal' in playerGroups) {
+			output += 'Liberal  - ';
+		} else {
+			output += 'NoRole   - ';
+		}
+
+		if ('dead' in playerGroups) {
+			output += 'Dead'
+		} else if ('ja' in playerGroups) {
+			output += 'Ja'
+		} else if ('nein' in playerGroups) {
+			output += 'Nein'
+		} else {
+			output += 'Not Voted';
+		}
+		output += '\n';
 	}
 	socket.emit('sendAlert', output);
 };
@@ -2847,7 +1007,7 @@ module.exports.handleModerationAction = async (socket, userKey, data, skipCheck)
 						setTimeout(() => {
 							gameToEnd.publicPlayersState.forEach(player => (player.leftGame = true));
 							delete games[gameToEnd.general.uid];
-							sendGameList();
+							;
 						}, 5000);
 					}
 					break;
@@ -3248,7 +1408,7 @@ module.exports.handleModerationAction = async (socket, userKey, data, skipCheck)
 									if (foundUser) {
 										foundUser.customCardback = '';
 										io.sockets.in(uid).emit('gameUpdate', secureGame(game));
-										sendGameList();
+										;
 									}
 								});
 								account.save(() => {
@@ -3496,7 +1656,7 @@ module.exports.handleModerationAction = async (socket, userKey, data, skipCheck)
 						if (game) {
 							delete games[game.general.uid];
 							game.publicPlayersState.forEach(player => (player.leftGame = true)); // Causes timed games to stop.
-							sendGameList();
+							;
 						}
 					} else if (data.userName.substr(0, 13) === 'RESETGAMENAME') {
 						const game = games[data.userName.slice(13)];
@@ -3507,7 +1667,7 @@ module.exports.handleModerationAction = async (socket, userKey, data, skipCheck)
 								modaction.modNotes = `Name: "${game.general.name}" - Creator: "${game.general.gameCreatorName}"`;
 							}
 							games[game.general.uid].general.name = 'New Game';
-							sendGameList();
+							;
 						}
 					} else if (isSuperMod && data.action.type) {
 						const setType = /setRWins/.test(data.action.type)
@@ -3640,8 +1800,9 @@ module.exports.handleModerationAction = async (socket, userKey, data, skipCheck)
  * @param {string} userKey - A user cache key
  * @param {object} data - A message payload
  */
-module.exports.handlePlayerReport = async (userKey, gameKey, data) => {
+module.exports.handlePlayerReport = async (userKey, data) => {
 	const user = await userInfo.get(userKey);
+	const gameKey = user.currentGame;
 
 	if (data.userName !== 'from replay' && (!user || user.wins + user.losses < 2) && process.env.NODE_ENV === 'production') {
 		return;
@@ -3688,17 +1849,17 @@ module.exports.handlePlayerReport = async (userKey, gameKey, data) => {
 
 	const httpEscapedComment = data.comment.replace(/( |^)(https?:\/\/\S+)( |$)/gm, '$1<$2>$3').replace(/@/g, '`@`');
 
-	const release = await games.acquire(gameKey);
-	const game = await games.get(gameKey);
+	const { stage } = await games.getState(gameKey, )
+	const { blindMode } = await games.getConfig(gameKey, 'blindMode');
 
-	const blindModeAnonymizedPlayer = game.general.blindMode
-		? game.gameState.isStarted
+	const blindModeAnonymizedPlayer = blindMode
+		? stage === stages.PLAYING
 			? `${data.reportedPlayer.split(' ')[0]} Anonymous`
 			: 'Anonymous'
 		: data.reportedPlayer;
 
 	const body = JSON.stringify({
-		content: `Game UID: <https://secrethitler.io/game/#/table/${data.uid}>\nReported player: ${blindModeAnonymizedPlayer}\nReason: ${playerReport.reason}\nComment: ${httpEscapedComment}`
+		content: `Game UID: <https://secrethitler.io/game/#/table/${gameKey}>\nReported player: ${blindModeAnonymizedPlayer}\nReason: ${playerReport.reason}\nComment: ${httpEscapedComment}`
 	});
 
 	const options = {
@@ -3710,15 +1871,6 @@ module.exports.handlePlayerReport = async (userKey, gameKey, data) => {
 			'Content-Length': Buffer.byteLength(body)
 		}
 	};
-
-	if (!game.reportCounts) game.reportCounts = {};
-	if (!game.reportCounts[userKey]) game.reportCounts[userKey] = 0;
-	if (game.reportCounts[userKey] >= 4) {
-		return;
-	}
-	game.reportCounts[userKey]++;
-
-	await games.set(gameKey, game).then(release);
 
 	try {
 		const req = https.request(options);
@@ -3732,22 +1884,6 @@ module.exports.handlePlayerReport = async (userKey, gameKey, data) => {
 			console.log(err, 'Failed to save player report');
 			return;
 		}
-
-		Account.find({ staffRole: { $exists: true, $ne: 'veteran' } }).then(accounts => {
-			accounts.forEach(account => {
-				const onlineSocketId = Object.keys(io.sockets.sockets).find(
-					socketId =>
-						io.sockets.sockets[socketId].handshake.session.passport && io.sockets.sockets[socketId].handshake.session.passport.user === account.username
-				);
-
-				account.gameSettings.newReport = true;
-
-				if (onlineSocketId) {
-					io.sockets.sockets[onlineSocketId].emit('reportUpdate', true);
-				}
-				account.save();
-			});
-		});
 	});
 };
 
@@ -3768,7 +1904,7 @@ module.exports.handlePlayerReportDismiss = () => {
 	});
 };
 
-module.exports.handleHasSeenNewPlayerModal = userKey => {
+module.exports.handleHasSeenNewPlayerModal = (socket, userKey) => {
 	if (userKey != null) {
 		Account.findOne({ username: userKey }).then(account => {
 			account.hasNotDismissedSignupModal = false;

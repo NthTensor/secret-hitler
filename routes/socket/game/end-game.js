@@ -49,8 +49,6 @@ const saveGame = game => {
 		casualGame: casualBool,
 		customGame: game.customGameSettings.enabled,
 		isRainbow: game.general.rainbowgame,
-		isTournyFirstRound: game.general.isTourny && game.general.tournyInfo.round === 1,
-		isTournySecondRound: game.general.isTourny && game.general.tournyInfo.round === 2
 	});
 
 	let enhanced;
@@ -143,24 +141,22 @@ module.exports.completeGame = (game, winningTeamName) => {
 		)
 	};
 
-	if (!(game.general.isTourny && game.general.tournyInfo.round === 1)) {
-		winningPrivatePlayers.forEach((player, index) => {
-			publicPlayersState.find(play => play.userName === player.userName).notificationStatus = 'success';
-			publicPlayersState.find(play => play.userName === player.userName).isConfetti = true;
-			player.wonGame = true;
-		});
+	winningPrivatePlayers.forEach((player, index) => {
+		publicPlayersState.find(play => play.userName === player.userName).notificationStatus = 'success';
+		publicPlayersState.find(play => play.userName === player.userName).isConfetti = true;
+		player.wonGame = true;
+	});
 
-		setTimeout(() => {
-			winningPrivatePlayers.forEach((player, index) => {
-				publicPlayersState.find(play => play.userName === player.userName).isConfetti = false;
-			});
-			sendInProgressGameUpdate(game, true);
-		}, 15000);
-	}
+	setTimeout(() => {
+		winningPrivatePlayers.forEach((player, index) => {
+			publicPlayersState.find(play => play.userName === player.userName).isConfetti = false;
+		});
+		sendInProgressGameUpdate(game, true);
+	}, 15000);
 
 	game.general.status = winningTeamName === 'fascist' ? 'Fascists win the game.' : 'Liberals win the game.';
 	game.gameState.isCompleted = winningTeamName;
-	sendGameList();
+	;
 
 	publicPlayersState.forEach((publicPlayer, index) => {
 		publicPlayer.nameStatus = seatedPlayers[index].role.cardName;
@@ -187,7 +183,6 @@ module.exports.completeGame = (game, winningTeamName) => {
 		})
 			.then(results => {
 				const isRainbow = game.general.rainbowgame;
-				const isTournamentFinalGame = game.general.isTourny && game.general.tournyInfo.round === 2;
 				const eloAdjustments = rateEloGame(game, results, winningPlayerNames);
 
 				results.forEach(player => {
@@ -243,15 +238,6 @@ module.exports.completeGame = (game, winningTeamName) => {
 						player[`lossesSeason${CURRENTSEASONNUMBER}`] = player[`lossesSeason${CURRENTSEASONNUMBER}`] ? player[`lossesSeason${CURRENTSEASONNUMBER}`] : 0;
 						winner = true;
 
-						if (isTournamentFinalGame && !game.general.casualGame) {
-							player.gameSettings.tournyWins.push(Date.now());
-							const playerSocketId = Object.keys(io.sockets.sockets).find(
-								socketId =>
-									io.sockets.sockets[socketId].handshake.session.passport && io.sockets.sockets[socketId].handshake.session.passport.user === player.username
-							);
-
-							io.sockets.sockets[playerSocketId].emit('gameSettings', player.gameSettings);
-						}
 					} else {
 						if (isRainbow) {
 							player.rainbowLosses = player.rainbowLosses ? player.rainbowLosses + 1 : 1;
@@ -293,9 +279,6 @@ module.exports.completeGame = (game, winningTeamName) => {
 									? userEntry[`lossesSeason${CURRENTSEASONNUMBER}`]
 									: 0;
 
-								if (isTournamentFinalGame && !game.general.casualGame) {
-									userEntry.tournyWins.push(Date.now());
-								}
 							} else {
 								if (isRainbow) {
 									userEntry.rainbowLosses = userEntry.rainbowLosses ? userEntry.rainbowLosses + 1 : 1;
@@ -324,147 +307,5 @@ module.exports.completeGame = (game, winningTeamName) => {
 			.catch(err => {
 				console.log(err, 'error in updating accounts at end of game');
 			});
-	}
-
-	if (game.general.isTourny) {
-		if (game.general.tournyInfo.round === 1) {
-			const { uid } = game.general;
-			const tableUidLastLetter = uid.charAt(uid.length - 1);
-			const otherUid = tableUidLastLetter === 'A' ? `${uid.substr(0, uid.length - 1)}B` : `${uid.substr(0, uid.length - 1)}A`;
-			const otherGame = games.find(g => g.general.uid === otherUid);
-
-			if (!otherGame || otherGame.gameState.isCompleted) {
-				const finalGame = _.cloneDeep(game);
-				let gamePause = 10;
-
-				finalGame.general.uid = `${uid.substr(0, uid.length - 1)}Final`;
-				finalGame.general.timeCreated = new Date();
-				finalGame.gameState = {
-					previousElectedGovernment: [],
-					undrawnPolicyCount: 17,
-					discardedPolicyCount: 0,
-					presidentIndex: -1,
-					isStarted: true
-				};
-				finalGame.trackState = {
-					liberalPolicyCount: 0,
-					fascistPolicyCount: 0,
-					electionTrackerCount: 0,
-					enactedPolicies: []
-				};
-
-				const countDown = setInterval(() => {
-					if (gamePause) {
-						game.general.status = `Final game starts in ${gamePause} ${gamePause === 1 ? 'second' : 'seconds'}.`;
-						if (otherGame) {
-							otherGame.general.status = `Final game starts in ${gamePause} ${gamePause === 1 ? 'second' : 'seconds'}.`;
-							sendInProgressGameUpdate(otherGame);
-						}
-						sendInProgressGameUpdate(game);
-						gamePause--;
-					} else {
-						clearInterval(countDown);
-						game.general.status = 'Final game has begun.';
-						if (otherGame) {
-							otherGame.general.status = 'Final game has begun.';
-							sendInProgressGameUpdate(otherGame);
-						}
-						game.general.tournyInfo.isRound1TableThatFinished2nd = true;
-						sendInProgressGameUpdate(game);
-						const winningPlayerSocketIds = Object.keys(io.sockets.sockets).filter(
-							socketId =>
-								io.sockets.sockets[socketId].handshake.session.passport &&
-								winningPrivatePlayers.map(player => player.userName).includes(io.sockets.sockets[socketId].handshake.session.passport.user)
-						);
-
-						// crash here line 302 map of undefined.  Not sure how this didn't exist at this time.  Race condition in settimeout/interval?  Both games completed at almost the same time?  Dunno.
-						const otherGameWinningPlayerSocketIds = Object.keys(io.sockets.sockets).filter(
-							socketId =>
-								io.sockets.sockets[socketId].handshake.session.passport &&
-								game.general.tournyInfo.winningPlayersFirstCompletedGame
-									.map(player => player.userName)
-									.includes(io.sockets.sockets[socketId].handshake.session.passport.user)
-						);
-
-						const socketIds = winningPlayerSocketIds.concat(otherGameWinningPlayerSocketIds);
-
-						socketIds.forEach(id => {
-							const socket = io.sockets.sockets[id];
-
-							Object.keys(socket.rooms).forEach(roomUid => {
-								socket.leave(roomUid);
-							});
-							socket.join(finalGame.general.uid);
-							socket.emit('joinGameRedirect', finalGame.general.uid);
-						});
-
-						finalGame.general.tournyInfo.round = 2;
-						finalGame.general.electionCount = 0;
-						finalGame.publicPlayersState = game.general.tournyInfo.winningPlayersFirstCompletedGame
-							.concat(game.private.seatedPlayers.filter(player => player.role.team === winningTeamName))
-							.map(player => {
-								player.cardStatus = {
-									cardDisplayed: false,
-									isFlipped: false,
-									cardFront: 'secretrole',
-									cardBack: {}
-								};
-
-								player.isDead = false;
-
-								return player;
-							});
-
-						if (finalGame.general.blindMode) {
-							const _shuffledAdjectives = _.shuffle(adjectives);
-
-							finalGame.general.replacementNames = _.shuffle(animals)
-								.slice(0, finalGame.publicPlayersState.length)
-								.map((animal, index) => `${_shuffledAdjectives[index].charAt(0).toUpperCase()}${_shuffledAdjectives[index].slice(1)} ${animal}`);
-						}
-
-						finalGame.private.lock = {};
-						finalGame.general.name = `${game.general.name.slice(0, game.general.name.length - 7)}-tableFINAL`;
-						games.push(finalGame);
-						require('./start-game.js')(finalGame); // circular dep.
-						sendGameList();
-					}
-				}, 1000);
-			} else {
-				game.general.tournyInfo.showOtherTournyTable = true;
-				game.chats.push({
-					gameChat: true,
-					timestamp: new Date(),
-					chat: [
-						{
-							text: 'This tournament game has finished first.  Winning players will be pulled into the final round when it starts.'
-						}
-					]
-				});
-				otherGame.general.tournyInfo.winningPlayersFirstCompletedGame = _.cloneDeep(game.private.seatedPlayers).filter(
-					player => player.role.team === winningTeamName
-				);
-				sendInProgressGameUpdate(game);
-			}
-		} else {
-			if (!game.general.casualGame) {
-				game.publicPlayersState.forEach(player => {
-					if (winningPlayerNames.includes(player.userName)) {
-						player.tournyWins.push(new Date().getTime());
-					}
-				});
-			}
-			game.chats.push({
-				gameChat: true,
-				timestamp: new Date(),
-				chat: [
-					{
-						text: 'The tournament has ended.'
-					}
-				]
-			});
-			game.general.status = 'The tournament has ended.';
-			sendInProgressGameUpdate(game);
-		}
 	}
 };

@@ -30,10 +30,6 @@ describe('user events', () => {
 		expect(typeof handleUpdatedBio).toBe('function');
 	});
 
-	it('has an handleUpdatedPlayerNote function', () => {
-		expect(typeof handleUpdatedPlayerNote).toBe('function');
-	});
-
 	it('has an handleAddNewGame function', () => {
 		expect(typeof handleAddNewGame).toBe('function');
 	});
@@ -72,10 +68,6 @@ describe('user events', () => {
 
 	it('has an handlePlayerReportDismiss function', () => {
 		expect(typeof handlePlayerReportDismiss).toBe('function');
-	});
-
-	it('has an checkUserStatus function', () => {
-		expect(typeof checkUserStatus).toBe('function');
 	});
 
 	it('has an handleUserLeaveGame function', () => {

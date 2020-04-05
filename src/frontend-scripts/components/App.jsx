@@ -258,7 +258,7 @@ export class App extends React.Component {
 		});
 
 		socket.on('generalChats', chats => {
-			dispatch(updateGeneralChats(chats));
+			dispatch(updateGeneralChats(JSON.parse(chats))); /* We have to parse this, Socket.io wont do it for us */
 		});
 
 		socket.on('reportUpdate', reportStatus => {
@@ -382,7 +382,6 @@ export class App extends React.Component {
 			experiencedMode: false,
 			disableChat: false,
 			disableObserver: false,
-			isTourny: false,
 			disableGamechat: false,
 			rainbowgame: false,
 			blindMode: false,

@@ -54,17 +54,10 @@ general
 	livingPlayerCount number
 	electionCount number, starts at 0
 	privateOnly bool only anons can play
-	isTourny bool
 	rebalance6p bool
 	rebalance7p bool
 	rebalance9p bool
 	rerebalance9p bool
-	tournyInfo
-		round number
-		showOtherTournyTable bool
-		queuedPlayers array of objects
-		isCancelled bool
-		isRound1TableThatFinished2nd bool
 seatedPlayers array 5-10
 	obj
 		connected bool

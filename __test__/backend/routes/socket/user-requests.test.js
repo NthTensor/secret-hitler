@@ -7,7 +7,7 @@ import {
 	sendGameList,
 	sendUserReports,
 	sendGeneralChats,
-	sendGameInfo
+	joinGameLobby
 } from '../../../../routes/socket/user-requests';
 
 describe('user requests', () => {
@@ -37,6 +37,6 @@ describe('user requests', () => {
 		expect(typeof sendGeneralChats).toBe('function');
 	});
 	it('has an sendGameInfo function', () => {
-		expect(typeof sendGameInfo).toBe('function');
+		expect(typeof joinGameLobby).toBe('function');
 	});
 });

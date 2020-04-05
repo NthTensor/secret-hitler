@@ -142,6 +142,7 @@ const checkIP = config => {
 				});
 				ipBanned = true;
 			} else {
+
 				testIP(signupIP, (banType, unbanTime) => {
 					if (hasBypass && banType == 'new') banType = null;
 					if (banType && !hasBypass) {

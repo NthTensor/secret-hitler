@@ -5,6 +5,7 @@ const GameSummary = require('../models/game-summary');
 const Profile = require('../models/profile');
 const { socketRoutes } = require('./socket/routes');
 const _ = require('lodash');
+const { groups } = require('./socket/models');
 const { accounts } = require('./accounts');
 const version = require('../version');
 const { expandAndSimplify, obfIP } = require('./socket/ip-obf');
@@ -319,11 +320,9 @@ module.exports = () => {
 			.catch(err => debug(err));
 	});
 
-	app.get('/online-playercount', (req, res) => {
-		const { userList } = require('./socket/models');
-
+	app.get('/online-playercount', async (req, res) => {
 		res.json({
-			count: userList.length
+			count: await groups.count('online')
 		});
 	});
 

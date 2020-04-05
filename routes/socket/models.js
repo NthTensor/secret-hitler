@@ -1,11 +1,10 @@
-/* removed temporarily
+
 const { CURRENTSEASONNUMBER } = require('../../src/frontend-scripts/node-constants');
 const Account = require('../../models/account');
 const ModAction = require('../../models/modAction');
-*/
-const { generateCombination } = require('gfycat-style-urls');
 const BannedIP = require('../../models/bannedIP');
 const Mortice = require('mortice');
+const _ = require('lodash');
 
 const fs = require('fs');
 const emotes = [];
@@ -100,20 +99,166 @@ module.exports.getPowerFromUser = user => {
 	return getPowerFromRole(user.staffRole);
 };
 
-const acquire = prefix => async function (key) {
-	return Mortice(`${prefix}:${key}`).writeLock();
-};
+/**
+ * @typedef {Object} Mutex
+ * @property {function(): Promise<function(): void>} writeLock
+ * @property {function(): Promise<function(): void>} readLock
+ */
 
-const acquireAll = prefix => async function (keys) {
-	const releases = await Promise.all(keys.map(key => Mortice(`${prefix}:${key}`).writeLock()));
-	return () => {
-		releases.forEach(release => release());
+/**
+ * Creates a lock for a single key
+ * @param {string} key - Key to lock
+ * @return {Mutex}
+ */
+function acquire(key) {
+	const mutex =  Mortice(key);
+	return {
+		async writeLock() {
+			console.log(`Awaiting write lock for ${key}`);
+			return mutex.writeLock().then(() => console.log(`Received write lock for ${key}`));
+		},
+		async readLock() {
+			console.log(`Awaiting read lock for ${key}`);
+			return mutex.readLock().then(() => console.log(`Received write lock for ${key}`));
+		}
 	};
-};
+}
 
-const acquireEach = prefix => async function* (keys) {
-	for (const key of keys) {
-		yield { key, release: await Mortice(`${prefix}:${key}`).writeLock() };
+/**
+ * Creates a lock for every key in a list (at the same time)
+ * @param {string[]} keys - A list of keys to lock
+ * @return {Mutex}
+ */
+function acquireAll(keys) {
+	const mutexes = keys.map(key => acquire(key));
+	return {
+		async writeLock() {
+			return Promise
+				.all(mutexes.map(async mutex => mutex.writeLock()))
+				.then(releases => () => releases.forEach(releases => releases()));
+		},
+		async readLock() {
+			return Promise
+				.all(mutexes.map(async mutex => mutex.readLock()))
+				.then(releases => () => releases.forEach(releases => releases()));
+		}
+	};
+}
+
+/**
+ * Creates a lock for every key in a list (individually, in the order that they become available)
+ * @param {string[]} keys - A list of keys to lock
+ * @return {{writeLock: (function(): AsyncIterableIterator<*>), readLock: (function(): AsyncIterableIterator<*>)}}
+ */
+function acquireEach(keys) {
+	const mutexes = keys.map(key => acquire(key));
+	return {
+		/**
+		 * Generates write lock & key pairs
+		 * @yield {Promise<{release: function(): void, key: string}>}
+		 */
+		async *writeLock() {
+			for (let i = 0; i < keys.length; i++) {
+				yield mutexes[i].writeLock().then(release => ({ key: keys[i], release }));
+			}
+		},
+		/**
+		 * Generates readLock lock & key pairs
+		 * @yield {Promise<{release: function(): void, key: string}>}
+		 */
+		async *readLock() {
+			for (let i = 0; i < keys.length; i++) {
+				yield mutexes[i].readLock().then(release => ({ key: keys[i], release }));
+			}
+		}
+	};
+}
+
+async function hset(key, props) {
+	for (const [name, value] in Object.entries(props)) {
+		if (Object.hasOwnProperty(name)) {
+			props[name] = JSON.stringify(value);
+		}
+	}
+	await redis.hset(key, props);
+}
+
+async function hget(key, names) {
+  let results;
+	if (names != null) {
+		results = await redis.hset(key, names);
+	} else {
+		results = await redis.hgetall(key)
+	}
+	const props = {};
+	for (const [key, value] in Object.entries(results)) {
+		if (Object.hasOwnProperty(key)) {
+			props[key] = JSON.parse(value);
+		}
+	}
+	return props;
+}
+
+function applyPrefix(prefix, keys) {
+	return keys.map(key => `${prefix}:${key}`);
+}
+
+module.exports.gameSets = {
+	/**
+	 * Adds a game to a game set.
+	 *
+	 * @param {string} setKey - A game set cache key
+	 * @param {string} gameKey - A game cache key
+	 * @return {Promise<void>}
+	 */
+	async add(setKey, gameKey) {
+		await redis.sadd(`game+set:${setKey}`, gameKey);
+	},
+
+	/**
+	 * Removes.
+	 *
+	 * @param {string} setKey - A game set cache key
+	 * @param {string} gameKey - A game cache key
+	 * @return {Promise<void>}
+	 */
+	async remove(setKey, gameKey) {
+		await redis.srem(`game+set:${setKey}`, gameKey);
+	},
+
+	/**
+	 * Gets all the gameKeys in a set
+	 *
+	 * @param {string} setKey - A game set cache key
+	 * @return {Promise<string[]>}
+	 */
+	async members(setKey) {
+		return redis.smembers(`game+set:${setKey}`);
+	},
+
+	/**
+	 * Determine whether a game is a member of a set.
+	 *
+	 * @param {string} setKey - A game set cache key
+	 * @param {string} gameKey - A game cache key
+	 * @return {Promise<*>}
+	 */
+	async isMember(setKey, gameKey) {
+		return redis.sismember(`game+set:${setKey}`, gameKey);
+	},
+
+	/**
+	 * Gets all the gameKeys in a set and clears the set
+	 *
+	 * @param {string} setKey - A game set cache key
+	 * @return {Promise<string[]>}
+	 */
+	async popAll(setKey) {
+		const results = await redis.pipeline()
+			.smembers(`game+set:${setKey}`)
+			.del(`game+set:${setKey}`)
+			.exec();
+		return results[1][1];
 	}
 };
 
@@ -121,112 +266,137 @@ const acquireEach = prefix => async function* (keys) {
  * Games model.
  */
 module.exports.games = {
-	acquire: acquire('game'),
-	acquireAll: acquireAll('game'),
-	acquireEach: acquireEach('game'),
+	acquire: (key) => acquire(`game:${key}`),
+	acquireAll: (...keys) => acquireAll(applyPrefix('game', keys)),
+	acquireEach: (...keys) => acquireEach(applyPrefix('game', keys)),
 
 	/**
-	 * Stores games in redis.
-	 * Note: Chat will not be saved if you changed it manually. See `pushChat` instead.
+	 * Stores game state.
 	 *
-	 * Be sure to acquire a write lock before calling this method.
+	 * Be sure to acquire a write lock before calling.
 	 *
-	 * @param {string|Object} gameKeys - A key, or an object
-	 * @param {Object} [game] - An optional game
+	 * @param {string} gameKey - A game cache key
+	 * @param {Object} state - A game state object
+	 * @return {Promise<void>}
 	 *
 	 * @example
 	 *
-	 *     	games.set('key', game);
-	 *      games.set({key1: game1, key2: game2});
+	 *     	games.setState('gameKey', {undrawnPolicyCount: 1});
 	 */
-	async set(gameKeys, game) {
-		if (typeof gameKeys === 'string') {
-			delete game.chats;
-			return redis.set(`game:${gameKeys}:data`, JSON.stringify(game));
-		} else {
-			gameKeys.values().forEach(game => delete game.chats);
-			return redis.mset(gameKeys);
-		}
+	async setState(gameKey, state) {
+		await hset(`game:${gameKey}:state`, state);
 	},
 
 	/**
-	 * Like games.set, but for when you are sure the game is not already in redis.
-	 *
-	 * @param {Object} game - A new game
-	 * @return {string} - A cache key
-	 */
-	async register(game) {
-		const key = generateCombination(3, '', true);
-		const chats = [...game.chats];
-		delete game.chats;
-		await redis
-			.pipeline()
-			.set(`game:${key}:data`, JSON.stringify(game))
-			.rpush(`game:${key}:chat`, chats)
-			.sadd(`game+set:active`, key)
-			.exec();
-		return key;
-	},
-
-	/**
-	 * Removes games from redis.
-	 *
-	 * @param {string|string[]} gameKeys - Game cache keys
-	 * @return {Promise<void>}
-	 */
-	async remove(gameKeys) {
-		if (Array.isArray(gameKeys)) {
-			await redis
-				.pipeline()
-				.srem(`game+set:active`, gameKeys)
-				.del(gameKeys.map(gameKey => `game:${gameKey}:data`))
-				.del(gameKeys.map(gameKey => `game:${gameKey}:chat`))
-				.exec();
-		} else {
-			await redis
-				.pipeline()
-				.srem(`game+set:active`, gameKeys)
-				.del(`game:${gameKeys}:data` `game:${gameKeys}:chat`)
-				.exec();
-		}
-	},
-
-	/**
-	 * Retrieves games from redis.
-	 *
-	 * @param {string|string[]} gameKeys - A key or list of keys
-	 * @return {Promise<Object[]>|Promise<Object>}
-	 */
-	async get(gameKeys) {
-		if (Array.isArray(gameKeys)) {
-			return redis.mget(gameKeys).then(str_ents => str_ents.map(JSON.parse));
-		} else {
-			return redis.get(gameKeys).then(str => JSON.parse(str));
-		}
-	},
-
-	/**
-	 * Retrieves the keys of all active games.
-	 *
-	 * @return {Promise<string[]>}
-	 */
-	async keys() {
-		return redis.smembers('game+set:active');
-	},
-
-	/**
-	 * Push a new chat onto a game's chatroom.
-	 * Note: You do not need to acquire a lock to push new chat.
+	 * Increments a game state field. Returns the value before tncrement.
 	 *
 	 * @param {string} gameKey - A game cache key
+	 * @param {string} stateName - A game state key
+	 * @param {number} [ammount] - The ammount to increase by
+	 * @return {Promise<number>}
+	 */
+	async incrState(gameKey, stateName, ammount=1) {
+		return redis.hincrby(`game:${gameKey}:state`, stateName, ammount);
+	},
+
+	/**
+	 * Gets game state.
+	 *
+	 * @param {string} gameKey - A game cache key
+	 * @param {...string} [names] - An optional list of state element names
+	 * @return {Promise<object>}
+	 *
+	 * @example
+	 *
+	 *     	games.getState('gameKey', 'undrawnPolicyCount'});
+	 */
+	async getState(gameKey, ...names) {
+		return hget(`game:${gameKey}:state`, names);
+	},
+
+	/**
+	 * Delets keys from game state.
+	 *
+	 * @param {string} gameKey - A game cach key
+	 * @param {...string} names - A list of state element names
+	 * @return {Promise<void>}
+	 */
+	async deleteState(gameKey, ...names) {
+		await redis.hdel(`game:${gameKey}:state`, names);
+	},
+
+	/**
+	 * Stores game configuration.
+	 *
+	 * Be sure to acquire a write lock before calling.
+	 *
+	 * @param {string} gameKey - A game cache key
+	 * @param {Object} config - A game state object
+	 * @return {Promise<void>}
+	 */
+	async setConfig(gameKey, config) {
+		await hset(`game:${gameKey}:config`, config);
+	},
+
+	/**
+	 * Gets game configuration.
+	 *
+	 * @param {string} gameKey - A game cache key
+	 * @param {...string} [names] - An optional list of config element names
+	 */
+	async getConfig(gameKey, names) {
+		return hget(`game:${gameKey}:config`, names);
+	},
+
+	/**
+	 * Deletes part of a game configuration.
+	 *
+	 * @param {string} gameKey - A game cache key
+	 * @param {...string} names - A list of config element names
+	 * @return {Promise<void>}
+	 */
+	async deleteConfig(gameKey, ...names) {
+		await redis.hdel(`game:${gameKey}:config`, names);
+	},
+
+	/**
+	 * Push a new chat onto a chatroom channel
+	 *
+	 * When I was first implementing this, I first tried making one chat list for each game.
+	 * But that didn't work, because games are actually built on a collection of loosely
+	 * related chat rooms, each with it's own complex read/write authorization and purpose.
+	 *
+	 * To better model this, I have introduced the idea of 'chat channels'. Each chat must be
+	 * published to exactly one channel. You can later get the chat history for this channel
+	 * by passing the same channelKey to `chatGet`. You can also pass a list of channelKeys
+	 * to `chatGet` to get the combined history of all the channels.
+	 *
+	 * [Note 1]: Chat objects are intended to be serialized into strings once, and then never
+	 *           decentralized. Do not call JSON.parse on these.
+	 *
+	 * [Note 2]: Channels are supposed to give a nice seperation of concerns -- You should
+	 *           implement game logic ontop of them, not here. I suggest giving a each
+	 *           player a channel, based on their userKey -- and also having a seperate
+	 *           channel for game status updates, for moderators, for observers and so on.
+	 *
+	 * [Note 3]: You do not need to lock a game to push chat.
+	 *
+	 * @param {string} gameKey - A game cache key
+	 * @param {string} channelKey - A channel cache key
 	 * @param {Object|Object[]} chats - A chat object or array of chat objects
 	 * @return {Promise<void>}
 	 */
-	async chatPush(gameKey, chats) {
+	async writeChannel(gameKey, channelKey, chats) {
 		if (Array.isArray(chats)) {
-			await redis.rpush(`game:${gameKey}:chat`, chats.map(chat => JSON.stringify(chat)));
+			await redis.pipeline()
+				.sadd(`game:${gameKey}:channels`, channelKey)
+				.rpush(`game:${gameKey}:chat:${channelKey}`, chats.map(chat => JSON.stringify(chat)))
+				.exec();
 		} else {
-			await redis.rpush(`game:${gameKey}:chat`, JSON.stringify(chats));
+			await redis
+				.sadd(`game:${gameKey}:channels`, channelKey)
+				.rpush(`game:${gameKey}:chat:${channelKey}`, JSON.stringify(chats))
+				.exec();
 		}
 	},
 
@@ -234,20 +404,70 @@ module.exports.games = {
 	 * Retrieves an entire chat log for a game.
 	 *
 	 * @param {string} gameKey - A game cache key
-	 * @return {Promise<Object[]>}
+	 * @param {string|string[]} channelKeys - One or more channel cache keys
+	 * @return {Promise<string[]>}
 	 */
-	async chatGet(gameKey) {
-		return redis.get(`game:${gameKey}:chat`).then(chats => chats.map(JSON.parse));
+	async readChannels(gameKey, channelKeys) {
+		if (Array.isArray(channelKeys)) {
+			chats = [];
+			let pipeline = redis.pipeline();
+			for (const channelKey of channelKeys) {
+				pipeline = pipeline.lrange(`game:${gameKey}:chat:${channelKey}`, 0 -1);
+			}
+			return pipeline.exec()
+				.then(results => results.reduce((acc, val) => { (val[0] !== null) ? [...acc, ...val[1]] : acc }, [] ));
+		} else {
+			return redis.get(`game:${gameKey}:chat:${channelKeys}`);
+		}
 	},
 
-	/**
-	 * Determine whether a game is still active.
-	 *
-	 * @param {string} gameKey - A game cache key
-	 * @return {Promise<boolean>}
-	 */
-	async isActive(gameKey) {
-		return redis.smembers(`game+set:active`, gameKey);
+	async setCard(gameKey, userKey, card) {
+		await redis.hset(`game:${gameKey}:card`, userKey, JSON.stringify(card));
+	},
+
+	async getCards(gameKey) {
+		return hget(`game:${gameKey}:card`, null);
+	},
+
+	async remove(gameKey) {
+		const channels = await redis.smembers(`game:${gameKey}:channels`)
+			.then(channelKeys => `game:${gameKey}:chat:${channelKey}`);
+		await redis.del(`game:${gameKey}:state`, `game:${gameKey}:config`, `game:${gameKey}:card`, ...channels);
+	},
+};
+
+module.exports.stages = {
+	SETUP: 'setup',
+	STARTING: 'starting',
+	PLAYING: 'playing',
+	ENDED: 'ended',
+	ERROR: 'error',
+	REMADE: 'remade'
+};
+
+module.exports.phases = {
+	VOTING: 'voting',
+	SELECTING_CHANCELLOR: 'selectingChancellor',
+	CHANCELLOR_VOTE_ON_VETO: 'chancellorVoteOnVeto',
+	PRESIDENT_VOTE_ON_VETO: 'presidentVoteOnVeto',
+	ENACT_POLICY: 'enactPolicy',
+	POWERS: 'powers',
+};
+
+module.exports.channels = {
+	GAME: {
+		PUBLIC: "game:public",
+		PLAYER: "game:player",
+		HITLER: "game:hitler",
+		LIBERAL: "game:liberal",
+		FASCIST: "game:fasscist",
+		OBSERVER: 'game:observer'
+	},
+	STAFF: 'staff',
+	DEBUG: 'debug',
+	CHAT: {
+		PLAYER: 'chat:player',
+		OBSERVER: 'chat:observer'
 	}
 };
 
@@ -261,15 +481,25 @@ module.exports.groups = {
 	 * Note: Groups will not automatically persist across multiple connections
 	 *
 	 * @param {string} groupKey - A group cache key
-	 * @param {string} userKeys - One or more user cache keys
+	 * @param {string} userKey - A user cache key
+	 * @param {string} [gameKey] - An optional game cache key
 	 * @return {Promise<void>}
 	 */
-	async add(groupKey, userKeys) {
-		await redis
-			.multi()
-			.sadd(`groups:${groupKey}`, userKeys)
-			.sadd(`user+groups:${userKeys}`, groupKey)
-			.exec();
+	async add(groupKey, userKey, gameKey) {
+		if (gameKey != null) {
+			await redis
+				.multi()
+				.sadd(`game:${gameKey}:groups`, groupKey)
+				.sadd(`game:${gameKey}:group:${groupKey}`, userKey)
+				.sadd(`game:${gameKey}:rgroup:${userKey}`, groupKey)
+				.exec();
+		} else {
+			await redis
+				.multi()
+				.sadd(`group:${groupKey}`, userKey)
+				.sadd(`rgroup:${userKey}`, groupKey)
+				.exec();
+		}
 	},
 
 	/**
@@ -277,34 +507,53 @@ module.exports.groups = {
 	 *
 	 * @param {string} groupKey - A group cache key
 	 * @param {string} userKeys - One or more user cache keys
+	 * @param {string} [gameKey] - An optional game cache key
 	 * @return {Promise<void>}
 	 */
-	async remove(groupKey, userKeys) {
-		await redis
-			.multi()
-			.srem(`groups:${groupKey}`, userKeys)
-			.srem(`user+groups:${userKeys}`, groupKey)
-			.exec();
+	async remove(groupKey, userKeys, gameKey) {
+		if (gameKey != null) {
+			await redis
+				.multi()
+				.srem(`game:${gameKey}:group:${groupKey}`, userKeys)
+				.srem(`game:${gameKey}:rgroup${userKeys}`, groupKey)
+				.exec();
+		} else {
+			await redis
+				.multi()
+				.srem(`group:${groupKey}`, userKeys)
+				.srem(`rgroup:${userKeys}`, groupKey)
+				.exec();
+		}
 	},
 
 	/**
 	 * List all members of a group.
 	 *
 	 * @param {string} groupKey - A group cache key
+	 * @param {string} [gameKey] - A game cache key
 	 * @return {Promise<string[]>}
 	 */
-	async members(groupKey) {
-		return redis.smembers(`groups:${groupKey}`);
+	async members(groupKey, gameKey) {
+		if (gameKey != null) {
+			return redis.smembers(`game:${gameKey}:group:${groupKey}`);
+		} else {
+			return redis.smembers(`group:${groupKey}`);
+		}
 	},
 
 	/**
 	 * List all groups of a member.
 	 *
 	 * @param {string} userKey - A user cache key
+	 * @param {string} [gameKey] - A game cache key
 	 * @return {Promise<String[]>}
 	 */
-	async ofMember(userKey) {
-		return redis.smembers(`user+groups:${userKey}`);
+	async ofMember(userKey, gameKey) {
+		if (gameKey != null) {
+			return redis.smembers(`game:${gameKey}:rgroup:${userKeys}`);
+		} else {
+			return redis.smembers(`rgroup:${userKey}`);
+		}
 	},
 
 	/**
@@ -312,10 +561,93 @@ module.exports.groups = {
 	 *
 	 * @param {string} groupKey - A group cache key
 	 * @param {string} userKey - A user cache key
+	 * @param {string} [gameKey] - An optional game cache key
 	 * @return {Promise<boolean>}
 	 */
-	async isMember(groupKey, userKey) {
-		return redis.sismember(`groups:${groupKey}`, userKey);
+	async isMember(groupKey, userKey, gameKey) {
+		if (gameKey != null) {
+			return redis.sismember(`game:${gameKey}:group:${groupKey}`, userKey);
+		} else {
+			return redis.sismember(`group:${groupKey}`, userKey);
+		}
+	},
+
+	/**
+	 * Return the number of members in a group.
+	 *
+	 * @param {string} groupKey
+	 * @param {string} gameKey
+	 * @return {Promise<number>}
+	 */
+	async count(groupKey, gameKey) {
+		if (gameKey != null) {
+			return redis.scard(`game:${gameKey}:group:${groupKey}`);
+		} else {
+			return redis.scard(`group:${groupKey}`);
+		}
+	},
+
+	/**
+	 * Removes a user from all groups (game groups or otherwise).
+	 * Note: Try not to run this too often.
+	 *
+	 * @param {string} userKey - A user cache key
+	 * @param {string} [gameKey] - An optional user cache key
+	 * @return {Promise<void>}
+	 */
+	async removeFromAll(userKey, gameKey) {
+		if (gameKey != null) {
+			const groupKeys = await redis.smembers(`game:${gameKey}:rgroup:${userKey}`);
+			let pipeline = redis.pipeline().del(`game:${gameKey}:rgroup:${userKey}`);
+			for (const groupKey of groupKeys) {
+				pipeline = pipeline.srem(`game:${gameKey}:group:${groupKey}`, userKey);
+			}
+			await pipeline.exec();
+		} else {
+			const groupKeys = await redis.smembers(`rgroup:${userKey}`);
+			let pipeline = redis.pipeline().del(`rgroup:${userKey}`);
+			for (const groupKey of groupKeys) {
+				pipeline = pipeline.srem(`group:${groupKey}`, userKey);
+			}
+			await pipeline.exec();
+		}
+	},
+
+	/**
+	 * Removes all users from a group.
+	 * @param {string} groupKey - A group cache key
+	 * @param {string} [gameKey] - An optional game cache key
+	 * @return {Promise<void>}
+	 */
+	async empty(groupKey, gameKey) {
+		if (gameKey != null) {
+			const userKeys = await redis.smembers(`game:${gameKey}:group:${groupKey}`);
+			let pipeline = redis.pipeline().del(`game:${gameKey}:group:${groupKey}`);
+			for (const userKey of userKeys) {
+				pipeline = pipeline.srem(`game:${gameKey}:rgroup:${userKey}`, groupKey);
+			}
+			await pipeline.exec();
+		} else {
+			const userKeys = await redis.smembers(`group:${groupKey}`);
+			let pipeline = redis.pipeline().del(`group:${groupKey}`);
+			for (const userKey of userKeys) {
+				pipeline = pipeline.srem(`rgroup:${userKey}`, groupKey);
+			}
+			await pipeline.exec();
+		}
+	},
+
+	/**
+	 * Clears all groups of a game.
+	 *
+	 * @param {string} gameKey
+	 * @return {Promise<void>} - A game cache key
+	 */
+	async emptyAll(gameKey) {
+		if (gameKey != null) {
+			await redis.smembers(`game:${gameKey}:groups`)
+				.then(groupKeys => redis.del(groupKeys));
+		}
 	},
 
 	/**
@@ -351,9 +683,9 @@ module.exports.groups = {
  * Staff role and binary membership properties are modeled with groups.
  */
 module.exports.userInfo = {
-	acquire: acquire('user+info'),
-	acquireAll: acquireAll('user+info'),
-	acquireEach: acquireEach('user+info'),
+	acquire: (key) => acquire(`user+info:${key}`),
+	acquireAll: (...keys) => acquireAll(applyPrefix('user+info', keys)),
+	acquireEach: (...keys) => acquireEach(applyPrefix('user+info', keys)),
 
 	/**
 	 * Sets user properties.
@@ -361,7 +693,7 @@ module.exports.userInfo = {
 	 *
 	 * @param {string} userKey - A user cache key
 	 * @param {object|string} info - Either a properties object or the name of a property
-	 * @param {object} [value] - If info is the name of a property, then this is it's value
+	 * @param {*} [value] - If info is the name of a property, then this is it's value
 	 * @return {Promise<void>}
 	 *
 	 * @example
@@ -392,7 +724,7 @@ module.exports.userInfo = {
 	 *
 	 * @param {string} userKey - A user cache key
 	 * @param {string|string[]} [info] - Optional list of parameters to fetch
-	 * @return {Promise<object>}
+	 * @return {Promise<*>}
 	 *
 	 * @example
 	 *
@@ -400,21 +732,22 @@ module.exports.userInfo = {
 	 *      userInfo.get('key', 'prop');
 	 *      userInfo.get('key', ['prop1', 'prop2']);
 	 */
-	async get(userKey, info) {
-		let peroperties;
-		if (typeof info !== 'undefined') {
-			peroperties = await redis.hgetall(`user+info:${userKey}`)
+	async get(userKey, ...info) {
+		if (info != null && 'length' in info && info.length !== 0) {
+			const properties = await redis.hmget(`user+info:${userKey}`, info)
+				.then(props => props.map(JSON.parse));
+			return _.zipObject(info, properties);
 		} else {
-			peroperties = await redis.hget(`user+info:${userKey}`, info);
-		}
-
-		for (const property in peroperties) {
-			if (peroperties.hasOwnProperty(property)) {
-				peroperties[property] = JSON.parse(peroperties[property])
+			const properties = await redis.hgetall(`user+info:${userKey}`);
+			for (const property in properties) {
+				if (properties.hasOwnProperty(property)) {
+					if (properties[property] != null && properties[property] !== '') {
+						properties[property] = JSON.parse(properties[property]);
+					}
+				}
 			}
+			return properties;
 		}
-
-		return peroperties;
 	},
 
 	/**
@@ -479,10 +812,10 @@ module.exports.genChat = {
 		return redis
 			.multi()
 			.get(`sticky`)
-			.get(`gen+chat`)
+			.lrange(`gen+chat`, 0, 100)
 			.exec()
 			.then(results => {
-				return `{"sticky":"${results[0][1] || ""}","list":[${results[1][1].join(',')}]}`
+				return `{"sticky":"${results[0][1] || ""}","list":[${(results[1][1] || []).join(',')}]}`
 			});
 	},
 
@@ -500,7 +833,7 @@ module.exports.genChat = {
 	 * Returns the time since the last chat message was posted.
 	 * If there is no previous message, returns time since start.
 	 *
-	 * @return {Promise<Date>}
+	 * @return {Date}
 	 */
 	async timeSinceLast() {
 		const curTime = new Date();
@@ -518,9 +851,9 @@ module.exports.genChat = {
  * Store global boolean options here.
  */
 module.exports.options = {
-	acquire: acquire('opt'),
-	acquireAll: acquireAll('opt'),
-	acquireEach: acquireEach('opt'),
+	acquire: (key) => acquire(`opt:${key}`),
+	acquireAll: (...keys) => acquireAll(applyPrefix('opt', keys)),
+	acquireEach: (...keys) => acquireEach(applyPrefix('opt', keys)),
 
 	/**
 	 * Sets a global property.
@@ -588,143 +921,6 @@ module.exports.profiles = (() => {
 	return { get, push };
 })();
 
-module.exports.formattedUserList = async userKey => {
-	const prune = value => {
-		// Converts things like zero and null to undefined to remove it from the sent data.
-		return value ? value : undefined;
-	};
-
-	const isAEM = await isStandardAEM(userKey);
-	const onlineKeys = await module.exports.groups.members('online');
-	const onlineUsers = onlineKeys.map(async onlineKey => await module.exports.userInfo.get(onlineKey));
-	return onlineUsers
-		.map(userInfo => ({
-			userName: userInfo.userName,
-			wins: prune(userInfo.wins),
-			losses: prune(userInfo.losses),
-			rainbowWins: prune(userInfo.rainbowWins),
-			rainbowLosses: prune(userInfo.rainbowLosses),
-			isPrivate: prune(userInfo.isPrivate),
-			staffDisableVisibleElo: prune(userInfo.staffDisableVisibleElo),
-			staffDisableStaffColor: prune(userInfo.staffDisableStaffColor),
-
-			// Tournaments are disabled, no point sending this.
-			// tournyWins: user.tournyWins,
-
-			// Blacklists are sent in the sendUserGameSettings event.
-			// blacklist: user.blacklist,
-			status: 'status' in userInfo ? userInfo.status : undefined,
-			customCardback: userInfo.customCardback,
-			customCardbackUid: userInfo.customCardbackUid,
-			eloOverall: userInfo.eloOverall ? Math.floor(userInfo.eloOverall) : undefined,
-			eloSeason: userInfo.eloSeason ? Math.floor(userInfo.eloSeason) : undefined,
-			winsSeason: prune(userInfo[`winsSeason${CURRENTSEASONNUMBER}`]),
-			lossesSeason: prune(userInfo[`lossesSeason${CURRENTSEASONNUMBER}`]),
-			rainbowWinsSeason: prune(userInfo[`rainbowWinsSeason${CURRENTSEASONNUMBER}`]),
-			rainbowLossesSeason: prune(userInfo[`rainbowLossesSeason${CURRENTSEASONNUMBER}`]),
-			previousSeasonAward: userInfo.previousSeasonAward,
-			specialTournamentStatus: userInfo.specialTournamentStatus,
-			timeLastGameCreated: userInfo.timeLastGameCreated,
-			staffRole: prune(userInfo.staffRole),
-			staffIncognito: prune(userInfo.staffIncognito),
-			isContributor: prune(userInfo.isContributor)
-			// oldData: user
-		}))
-		.filter(user => isAEM || !user.staffIncognito);
-};
-
-const userListEmitter = {
-	state: 0,
-	send: false,
-	timer: setInterval(() => {
-		// 0.01s delay per user (1s per 100), always delay
-		if (!userListEmitter.send) {
-			userListEmitter.state = module.exports.userList.length / 10;
-			return;
-		}
-		if (userListEmitter.state > 0) userListEmitter.state--;
-		else {
-			userListEmitter.send = false;
-			io.sockets.emit('fetchUser'); // , {
-			// 	list: module.exports.formattedUserList()
-			// });
-		}
-	}, 100)
-};
-
-module.exports.userListEmitter = userListEmitter;
-
-module.exports.formattedGameList = async () => {
-	const allGames = await games.keys().then(keys => games.get(keys));
-	return allGames.map(game => ({
-			name: game.general.name,
-			flag: game.general.flag,
-			userNames: game.publicPlayersState.map(val => val.userName),
-			customCardback: game.publicPlayersState.map(val => val.customCardback),
-			customCardbackUid: game.publicPlayersState.map(val => val.customCardbackUid),
-			gameStatus: game.gameState.isCompleted
-				? game.gameState.isCompleted
-				: game.gameState.isTracksFlipped
-					? 'isStarted'
-					: 'notStarted',
-			seatedCount: game.publicPlayersState.length,
-			gameCreatorName: game.general.gameCreatorName,
-			minPlayersCount: game.general.minPlayersCount,
-			maxPlayersCount: game.general.maxPlayersCount || game.general.minPlayersCount,
-			excludedPlayerCount: game.general.excludedPlayerCount,
-			casualGame: game.general.casualGame || undefined,
-			eloMinimum: game.general.eloMinimum || undefined,
-			isVerifiedOnly: game.general.isVerifiedOnly || undefined,
-			isTourny: game.general.isTourny || undefined,
-			timedMode: game.general.timedMode || undefined,
-			flappyMode: game.general.flappyMode || undefined,
-			flappyOnlyMode: game.general.flappyOnlyMode || undefined,
-			tournyStatus: (() => {
-				if (game.general.isTourny) {
-					if (game.general.tournyInfo.queuedPlayers && game.general.tournyInfo.queuedPlayers.length) {
-						return {
-							queuedPlayers: game.general.tournyInfo.queuedPlayers.length
-						};
-					}
-				}
-				return undefined;
-			})(),
-			experiencedMode: game.general.experiencedMode || undefined,
-			disableChat: game.general.disableChat || undefined,
-			disableGamechat: game.general.disableGamechat || undefined,
-			blindMode: game.general.blindMode || undefined,
-			enactedLiberalPolicyCount: game.trackState.liberalPolicyCount,
-			enactedFascistPolicyCount: game.trackState.fascistPolicyCount,
-			electionCount: game.general.electionCount,
-			rebalance6p: game.general.rebalance6p || undefined,
-			rebalance7p: game.general.rebalance7p || undefined,
-			rebalance9p: game.general.rerebalance9p || undefined,
-			privateOnly: game.general.privateOnly || undefined,
-			private: game.general.private || undefined,
-			uid: game.general.uid,
-			rainbowgame: game.general.rainbowgame || undefined,
-			isCustomGame: game.customGameSettings.enabled,
-			isUnlisted: game.general.unlisted || undefined
-	}));
-};
-
-const gameListEmitter = {
-	state: 0,
-	send: false,
-	timer: setInterval(() => {
-		// 3 second delay, instant send
-		if (gameListEmitter.state > 0) gameListEmitter.state--;
-		else {
-			if (!gameListEmitter.send) return;
-			gameListEmitter.send = false;
-			io.sockets.emit('gameList', module.exports.formattedGameList());
-			gameListEmitter.state = 30;
-		}
-	}, 100)
-};
-
-module.exports.gameListEmitter = gameListEmitter;
-
 module.exports.AEM = Account.find({ staffRole: { $exists: true, $ne: 'veteran' } });
 
 const bypassKeys = [];
@@ -772,27 +968,34 @@ const banLength = {
 	tiny: 1 * 60 * 60 * 1000, // 1 hour
 	big: 7 * 24 * 60 * 60 * 1000 // 7 days
 };
+module.exports.testIP = async (IP, callback) => {
+	const ipbansNotEnforced = await module.exports.options.get('ipbansNotEnforced', false);
+	if (!IP) callback('Bad IP!');
+	else if (ipbansNotEnforced) callback(null);
+	else {
+		BannedIP.find({ ip: IP }, (err, ips) => {
+			if (err) callback(err);
+			else {
+				let date;
+				let unbannedTime;
+				const ip = ips.sort((a, b) => b.bannedDate - a.bannedDate)[0];
 
-/**
- * Finds and summarises IP bans
- *
- * @param {*} address - An ip address
- * @return {Promise<{isBanned:boolean}>}
- */
-module.exports.findIPBan = async (address) => {
-	const disableIpBans = await module.exports.options.get('disableIPBans', false);
-	return BannedIP.find({ ip: address }).then(bans => {
-		const mostRecentBan = bans.sort((a, b) => b.bannedDate - a.bannedDate)[0];
-		const type = mostRecentBan.type;
-		const time = mostRecentBan.bannedDate.getTime() + (banLength[type] || banLength.big);
+				if (ip) {
+					date = Date.now();
+					unbannedTime = ip.bannedDate.getTime() + (banLength[ip.type] || banLength.big);
+				}
 
-		if (time > Date.now()) {
-			if (process.env.NODE_ENV === 'production' && !disableIpBans) {
-				return { isBanned: true, time, type }
-			} else {
-				console.log(`IP ban ignored: ${IP} = ${ip.type}`);
+				if (ip && unbannedTime > date) {
+					if (process.env.NODE_ENV === 'production') {
+						callback(ip.type, unbannedTime);
+					} else {
+						console.log(`IP ban ignored: ${IP} = ${ip.type}`);
+						callback(null);
+					}
+				} else {
+					callback(null);
+				}
 			}
-		}
-		return { isBanned: false }
-	});
+		});
+	}
 };

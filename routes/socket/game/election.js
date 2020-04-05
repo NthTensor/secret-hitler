@@ -1,7 +1,5 @@
 const { sendInProgressGameUpdate, sendInProgressModChatUpdate } = require('../util');
-const { startElection, shufflePolicies } = require('./common');
-const { sendGameList } = require('../user-requests');
-const { selectChancellor } = require('./election-util');
+const { phaseTransition, startElection, shufflePolicies, chatPlayer, chatText, chatTeam } = require('./common');
 const {
 	specialElection,
 	policyPeek,
@@ -17,6 +15,7 @@ const {
 const { completeGame } = require('./end-game');
 const _ = require('lodash');
 const { makeReport } = require('../report.js');
+const { groups, games } = require('../models');
 
 const powerMapping = {
 	investigate: [investigateLoyalty, 'The president must investigate the party membership of another player.'],
@@ -27,396 +26,166 @@ const powerMapping = {
 	peekdrop: [policyPeekAndDrop, 'The president must examine the top policy, and may discard it.']
 };
 
-const presidentPowers = [
-	{
-		0: null,
-		1: null,
-		2: powerMapping.deckpeek,
-		3: powerMapping.bullet,
-		4: powerMapping.bullet
-	},
-	{
-		0: null,
-		1: powerMapping.investigate,
-		2: powerMapping.election,
-		3: powerMapping.bullet,
-		4: powerMapping.bullet
-	},
-	{
-		0: powerMapping.investigate,
-		1: powerMapping.investigate,
-		2: powerMapping.election,
-		3: powerMapping.bullet,
-		4: powerMapping.bullet
-	}
-];
-
 /**
- * @param {object} game - game to act on.
- * @param {string} team - name of team that is enacting policy.
- * @param {object} socket - socket
+ * @param {object} socket - socket reference
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @param {object} data - from socket emit
+ * @param {bool} force - whether or not this action was forced
  */
-const enactPolicy = (game, team, socket) => {
-	const index = game.trackState.enactedPolicies.length;
-	const { experiencedMode } = game.general;
+module.exports.selectChancellor = async (socket, userKey, gameKey, data, force = false) => {
 
-	if (game.private.lock.selectChancellor) {
-		game.private.lock.selectChancellor = false;
+	const numPlayers = await groups.count('players', gameKey);
+
+	if (data.chancellorIndex >= numPlayers || data.chancellorIndex < 0) {
+		return;
 	}
 
-	if (game.private.lock.selectChancellorVoteOnVeto) {
-		game.private.lock.selectChancellorVoteOnVeto = false;
-	}
-
-	if (game.private.lock.selectChancellorPolicy) {
-		game.private.lock.selectChancellorPolicy = false;
-	}
-
-	if (game.private.lock.policyPeek) {
-		game.private.lock.policyPeek = false;
-	}
-
-	if (game.private.lock.policyPeekAndDrop) {
-		game.private.lock.policyPeekAndDrop = false;
-	}
-
-	if (game.private.lock.selectPlayerToExecute) {
-		game.private.lock.selectPlayerToExecute = false;
-	}
-
-	if (game.private.lock.executePlayer) {
-		game.private.lock.executePlayer = false;
-	}
-
-	if (game.private.lock.selectSpecialElection) {
-		game.private.lock.selectSpecialElection = false;
-	}
-
-	if (game.private.lock.specialElection) {
-		game.private.lock.specialElection = false;
-	}
-
-	if (game.private.lock.selectPartyMembershipInvestigate) {
-		game.private.lock.selectPartyMembershipInvestigate = false;
-	}
-
-	if (game.private.lock.investigateLoyalty) {
-		game.private.lock.investigateLoyalty = false;
-	}
-
-	if (game.private.lock.showPlayerLoyalty) {
-		game.private.lock.showPlayerLoyalty = false;
-	}
-
-	if (game.private.lock.selectPartyMembershipInvestigateReverse) {
-		game.private.lock.selectPartyMembershipInvestigateReverse = false;
-	}
-
-	if (game.private.lock.selectPolicies) {
-		game.private.lock.selectPolicies = false;
-	}
-
-	if (game.private.lock.selectOnePolicy) {
-		game.private.lock.selectOnePolicy = false;
-	}
-
-	if (game.private.lock.selectBurnCard) {
-		game.private.lock.selectBurnCard = false;
-	}
-
-	game.gameState.pendingChancellorIndex = null;
-
-	game.private.summary = game.private.summary.updateLog({
-		enactedPolicy: team
-	});
-
-	game.general.status = 'A policy is being enacted.';
-	game.trackState[`${team}PolicyCount`]++;
-	sendGameList();
-
-	game.trackState.enactedPolicies.push({
-		position: 'middle',
-		cardBack: team,
-		isFlipped: false
-	});
-
-	sendInProgressGameUpdate(game, true);
-
-	setTimeout(
-		() => {
-			game.trackState.enactedPolicies[index].isFlipped = true;
-			game.gameState.audioCue = team === 'liberal' ? 'enactPolicyL' : 'enactPolicyF';
-			sendInProgressGameUpdate(game, true);
-		},
-		process.env.NODE_ENV === 'development' ? 100 : experiencedMode ? 300 : 2000
-	);
-
-	setTimeout(
-		() => {
-			game.gameState.audioCue = '';
-			const chat = {
-				timestamp: new Date(),
-				gameChat: true,
-				chat: [
-					{ text: 'A ' },
-					{
-						text: team === 'liberal' ? 'liberal' : 'fascist',
-						type: team === 'liberal' ? 'liberal' : 'fascist'
-					},
-					{
-						text: ` policy has been enacted. (${
-							team === 'liberal' ? game.trackState.liberalPolicyCount.toString() : game.trackState.fascistPolicyCount.toString()
-						}/${team === 'liberal' ? '5' : '6'})`
-					}
-				]
-			};
-			const addPreviousGovernmentStatus = () => {
-				game.publicPlayersState.forEach(player => {
-					if (player.previousGovernmentStatus) {
-						player.previousGovernmentStatus = '';
-					}
-				});
-
-				if (game.trackState.electionTrackerCount <= 2 && game.publicPlayersState.findIndex(player => player.governmentStatus === 'isChancellor') > -1) {
-					game.publicPlayersState[game.gameState.presidentIndex].previousGovernmentStatus = 'wasPresident';
-					game.publicPlayersState[game.publicPlayersState.findIndex(player => player.governmentStatus === 'isChancellor')].previousGovernmentStatus =
-						'wasChancellor';
-				}
-			};
-			const powerToEnact =
-				team === 'fascist'
-					? game.customGameSettings.enabled
-						? powerMapping[game.customGameSettings.powers[game.trackState.fascistPolicyCount - 1]]
-						: presidentPowers[game.general.type][game.trackState.fascistPolicyCount - 1]
-					: null;
-
-			game.trackState.enactedPolicies[index].position =
-				team === 'liberal' ? `liberal${game.trackState.liberalPolicyCount}` : `fascist${game.trackState.fascistPolicyCount}`;
-
-			if (!game.general.disableGamechat) {
-				game.private.seatedPlayers.forEach(player => {
-					player.gameChats.push(chat);
-				});
-
-				game.private.unSeatedGameChats.push(chat);
-			}
-
-			if (game.trackState.liberalPolicyCount === 5 || game.trackState.fascistPolicyCount === 6) {
-				game.publicPlayersState.forEach((player, i) => {
-					player.cardStatus.cardFront = 'secretrole';
-					player.cardStatus.cardBack = game.private.seatedPlayers[i].role;
-					player.cardStatus.cardDisplayed = true;
-					player.cardStatus.isFlipped = false;
-				});
-
-				sendInProgressGameUpdate(game);
-
-				game.gameState.audioCue = game.trackState.liberalPolicyCount === 5 ? 'liberalsWin' : 'fascistsWin';
-				setTimeout(
-					() => {
-						game.publicPlayersState.forEach((player, i) => {
-							player.cardStatus.isFlipped = true;
-						});
-						game.gameState.audioCue = '';
-						if (process.env.NODE_ENV === 'development') {
-							completeGame(game, game.trackState.liberalPolicyCount === 1 ? 'liberal' : 'fascist');
-						} else {
-							completeGame(game, game.trackState.liberalPolicyCount === 5 ? 'liberal' : 'fascist');
-						}
-					},
-					process.env.NODE_ENV === 'development' ? 100 : 2000
-				);
-			} else if (powerToEnact && game.trackState.electionTrackerCount <= 2) {
-				const chat = {
-					timestamp: new Date(),
-					gameChat: true,
-					chat: [{ text: powerToEnact[1] }]
-				};
-
-				const { seatedPlayers } = game.private;
-
-				if (!game.general.disableGamechat) {
-					seatedPlayers.forEach(player => {
-						player.gameChats.push(chat);
-					});
-
-					game.private.unSeatedGameChats.push(chat);
-				}
-				powerToEnact[0](game);
-				addPreviousGovernmentStatus();
-
-				if (game.general.timedMode) {
-					const { presidentIndex } = game.gameState;
-
-					if (game.private.timerId) {
-						clearTimeout(game.private.timerId);
-						game.private.timerId = null;
-					}
-					game.gameState.timedModeEnabled = true;
-					game.private.timerId = setTimeout(
-						() => {
-							if (game.gameState.timedModeEnabled) {
-								const president = seatedPlayers[presidentIndex];
-								let list = seatedPlayers.filter((player, i) => i !== presidentIndex && !seatedPlayers[i].isDead);
-
-								game.gameState.timedModeEnabled = false;
-
-								switch (powerToEnact[1]) {
-									case 'The president must examine the top 3 policies.':
-										selectPolicies({ user: president.userName }, game, socket);
-										break;
-									case 'The president must select a player for execution.':
-										if (president.role.cardName === 'fascist') {
-											list = list.filter(player => player.role.cardName !== 'hitler');
-										}
-										selectPlayerToExecute({ user: president.userName }, game, { playerIndex: seatedPlayers.indexOf(_.shuffle(list)[0]) }, socket);
-										break;
-									case 'The president must investigate the party membership of another player.':
-										selectPartyMembershipInvestigate({ user: president.userName }, game, { playerIndex: seatedPlayers.indexOf(_.shuffle(list)[0]) }, socket);
-										break;
-									case 'The president must select a player for a special election.':
-										selectSpecialElection({ user: president.userName }, game, { playerIndex: seatedPlayers.indexOf(_.shuffle(list)[0]) }, socket);
-										break;
-								}
-							}
-						},
-						process.env.DEVTIMEDDELAY ? process.env.DEVTIMEDDELAY : game.general.timedMode * 1000
-					);
-					sendInProgressGameUpdate(game);
-				}
-			} else {
-				sendInProgressGameUpdate(game);
-				addPreviousGovernmentStatus();
-				startElection(game);
-			}
-
-			game.trackState.electionTrackerCount = 0;
-		},
-		process.env.NODE_ENV === 'development' ? 100 : experiencedMode ? 1000 : 4000
-	);
-};
-
-/**
- * @param {object} passport - socket authentication.
- * @param {object} game - target game.
- * @param {object} data - socket emit
- * @param {object} socket - socket
- */
-const selectPresidentVoteOnVeto = (passport, game, data, socket) => {
-	const { experiencedMode } = game.general;
-	const president = game.private.seatedPlayers[game.gameState.presidentIndex];
-	const chancellorIndex = game.publicPlayersState.findIndex(player => player.governmentStatus === 'isChancellor');
-	const publicChancellor = game.publicPlayersState[chancellorIndex];
-	const publicPresident = game.publicPlayersState[game.gameState.presidentIndex];
-
-	if (game.gameState.isGameFrozen) {
+	if (!force && await gameSets.isMember('frozen', gameKey)) {
 		if (socket) {
 			socket.emit('sendAlert', 'An AEM member has prevented this game from proceeding. Please wait.');
 		}
 		return;
 	}
 
-	if (game.general.isRemade) {
+	const release = await games.acquire(gameKey);
+	const numDead = await groups.count('dead', gameKey);
+	const { phase, seats, president, previousChancellor, previousPresident } =
+		await games.getState(gameKey, 'phase', 'seats', 'president', 'previousChancellor', 'previousPresident', 'electionCount');
+	const pendingChancellor = seats[data.chancellorIndex];
+
+	if (
+		phase === phases.SELECTING_CHANCELLOR
+		&& !await groups.isMember('dead', pendingChancellor, gameKey)
+		&& userKey === president
+		&& pendingChancellor !== president
+		&& pendingChancellor !== previousChancellor
+		&& (pendingChancellor !== previousPresident || numPlayers - numDead <= 5)
+	) {
+		await games.setState(gameKey, { pendingChancellor }).then(release);
+	} else {
+		release();
+	}
+};
+
+/**
+ * Enacts all policies in *Hand of gameKey.
+ *
+ * @param {string} gameKey - A game cache key.
+ */
+const enactPolicy = async (gameKey) => {
+
+	await games.setState(gameKey, {
+		status: `A policy is being enacted.`,
+		phase: phases.ENACT_POLICY
+	});
+	const { fascistHand, liberalHand } = await games.getState(gameKey, 'fascistHand', 'liberalHand');
+
+	await games.incrState(gameKey, 'fascistPlayed', fascistHand);
+	await games.incrState(gameKey, 'liberalPlayed', liberalHand);
+};
+
+/**
+ * Sample random card draws with a hypergeometric distribution.
+ * Moves cards from *Deck and *Discard to *Hand in game state.
+ *
+ * @param {string} gameKey - A game cache key
+ * @param {number} [numToDraw] - The number of keys to draw
+ */
+const drawCards = async (gameKey, numToDraw = 1) => {
+	const { fascistDeck, liberalDeck, fascistDiscard, liberalDiscard } = await games.getState(gameKey);
+	const deck = fascistDeck + liberalDeck;
+
+	if (deck < numToDraw) {
+		/* Merge the discard and re-draw */
+		await games.setState(gameKey, {
+			fascistDeck: fascistDeck + fascistDiscard,
+			liberalDeck: liberalDeck + liberalDiscard,
+			fascistDiscard: 0,
+			liberalDiscard: 0
+		});
+
+	}
+
+	if (numToDraw === 1) {
+		const team = _.sample(['fascist', 'liberal']);
+		await games.incrState(gameKey, `${team}Deck`, -1);
+		await games.incrState(gameKey, `${team}Hand`, 1);
+	} else {
+		for (let i = 0; i < numToDraw; i++) {
+			await drawCards(gameKey);
+		}
+	}
+};
+
+/**
+ * @param {object} socket
+ * @param {string} userKey
+ * @param {string} gameKey
+ * @param {object} data
+ */
+const selectPresidentVoteOnVeto = async (socket, userKey, gameKey, data) => {
+
+	if (await gameSets.isMember('frozen', gameKey)) {
 		if (socket) {
-			socket.emit('sendAlert', 'This game has been remade and is now no longer playable.');
+			socket.emit('sendAlert', 'An AEM member has prevented this game from proceeding. Please wait.');
 		}
 		return;
 	}
 
-	if (!president || president.userName !== passport.user) {
-		return;
+	const { stage, president, seats } = await games.getState(gameKey, 'stage', 'president', 'seats');
+
+	if (
+		stage === stages.PLAYING
+		&& president === userKey
+	) {
+		await games.setCard(gameKey, userKey, {
+			displayed: true,
+			front: 'ballot',
+			back: {
+				name: data.vote ? 'ja' : 'nein'
+			}
+		});
+		await games.writeChannel(gameKey, channels.GAME.PUBLIC, {
+			timestamp: new Date(),
+			chat: [
+				chatText('President '),
+				chatPlayer(president, seats),
+				chatText(data.vote ? ' has voted to veto this election.' : ' has voted not to veto this election.')
+			]
+		});
+		if (data.vote) {
+			/* The president voted to veto */
+			const numElectionTracker = await games.incrState(gameKey, 'electionTrackerCount');
+			await games.writeChannel(gameKey, channels.GAME.PUBLIC, {
+				timestamp: new Date(),
+				chat: [
+					chatText(`The President and Chancellor have voted to veto this election and the election tracker moves forward. (${numElectionTracker + 1}/3)`)
+				]
+			});
+		} else {
+			/* The veto fails, draw a random card to the hand, then play it. */
+			await drawCards(gameKey, 1);
+			await enactPolicy(gameKey);
+			await phaseTransition(gameKey);
+		}
 	}
 
-	game.private.summary = game.private.summary.updateLog({
-		presidentVeto: data.vote
-	});
 
 	if (
 		!game.private.lock.selectPresidentVoteOnVeto &&
 		Number.isInteger(chancellorIndex) &&
 		game.publicPlayersState[chancellorIndex] &&
-		!(game.general.isTourny && game.general.tournyInfo.isCancelled) &&
 		president.cardFlingerState &&
 		president.cardFlingerState[0]
 	) {
-		game.private.lock.selectPresidentVoteOnVeto = true;
-
-		game.publicPlayersState[chancellorIndex].isLoader = false;
-		publicPresident.isLoader = false;
-		president.cardFlingerState[0].action = president.cardFlingerState[1].action = '';
-		president.cardFlingerState[0].cardStatus.isFlipped = president.cardFlingerState[1].cardStatus.isFlipped = false;
-
-		if (data.vote) {
-			president.cardFlingerState[0].notificationStatus = 'selected';
-			president.cardFlingerState[1].notificationStatus = '';
-		} else {
-			president.cardFlingerState[0].notificationStatus = '';
-			president.cardFlingerState[1].notificationStatus = 'selected';
-		}
-
-		publicPresident.cardStatus = {
-			cardDisplayed: true,
-			cardFront: 'ballot',
-			cardBack: {
-				cardName: data.vote ? 'ja' : 'nein'
-			}
-		};
-
-		sendInProgressGameUpdate(game);
 
 		setTimeout(
 			() => {
-				const chat = {
-					timestamp: new Date(),
-					gameChat: true,
-					chat: [
-						{ text: 'President ' },
-						{
-							text: game.general.blindMode
-								? `{${game.private.seatedPlayers.indexOf(president) + 1}}`
-								: `${passport.user} {${game.private.seatedPlayers.indexOf(president) + 1}}`,
-							type: 'player'
-						},
-						{
-							text: data.vote ? ' has voted to veto this election.' : ' has voted not to veto this election.'
-						}
-					]
-				};
-
-				if (!game.general.disableGamechat) {
-					game.private.seatedPlayers.forEach(player => {
-						player.gameChats.push(chat);
-					});
-					game.private.unSeatedGameChats.push(chat);
-				}
-
-				publicPresident.cardStatus.isFlipped = true;
-
-				sendInProgressGameUpdate(game);
 
 				if (data.vote) {
-					game.trackState.electionTrackerCount++;
-					const chat = {
-						gameChat: true,
-						timestamp: new Date(),
-						chat: [
-							{
-								text: `The President and Chancellor have voted to veto this election and the election tracker moves forward. (${game.trackState.electionTrackerCount}/3)`
-							}
-						]
-					};
 
-					game.gameState.pendingChancellorIndex = null;
-					game.private.lock.selectChancellorPolicy = game.private.lock.selectPresidentVoteOnVeto = game.private.lock.selectChancellorVoteOnVeto = false;
 
-					if (!game.general.disableGamechat) {
-						game.private.seatedPlayers.forEach(player => {
-							player.gameChats.push(chat);
-						});
-
-						game.private.unSeatedGameChats.push(chat);
-					}
-					game.gameState.audioCue = 'passedVeto';
 					setTimeout(
 						() => {
 							game.gameState.audioCue = '';
@@ -472,188 +241,57 @@ const selectPresidentVoteOnVeto = (passport, game, data, socket) => {
 module.exports.selectPresidentVoteOnVeto = selectPresidentVoteOnVeto;
 
 /**
- * @param {object} passport - passport auth.
- * @param {object} game - target game.
- * @param {object} data - socket emit
- * @param {object} socket - socket
+ * @param {Object} socket - Socket reference
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @param {Object} data - Message payload
  */
-const selectChancellorVoteOnVeto = (passport, game, data, socket) => {
-	const { experiencedMode } = game.general;
-	const president = game.private.seatedPlayers[game.gameState.presidentIndex];
-	const chancellorIndex = game.publicPlayersState.findIndex(player => player.governmentStatus === 'isChancellor');
-	const chancellor = game.private.seatedPlayers.find(player => player.userName === game.private._chancellorPlayerName);
-	const publicChancellor = game.publicPlayersState[chancellorIndex];
+const selectChancellorVoteOnVeto = async (socket, userKey, gameKey, data) => {
 
-	if (game.gameState.isGameFrozen) {
+	if (gameSets.isMember('frozen', gameKey)) {
 		if (socket) {
 			socket.emit('sendAlert', 'An AEM member has prevented this game from proceeding. Please wait.');
 		}
 		return;
 	}
 
-	if (game.general.isRemade) {
-		if (socket) {
-			socket.emit('sendAlert', 'This game has been remade and is now no longer playable.');
-		}
-		return;
-	}
+	const { seats, stage, phase, chancellor } = await games.getState(gameKey, 'seats', 'stage', 'phase');
 
-	if (!publicChancellor || !publicChancellor.userName || passport.user !== publicChancellor.userName) {
-		return;
-	}
-
-	game.private.summary = game.private.summary.updateLog({
-		chancellorVeto: data.vote
-	});
-
-	game.private.lock.selectPresidentVoteOnVeto = false;
 	if (
-		!game.private.lock.selectChancellorVoteOnVeto &&
-		chancellor &&
-		chancellor.cardFlingerState &&
-		chancellor.cardFlingerState.length &&
-		game.publicPlayersState[chancellorIndex] &&
-		!(game.general.isTourny && game.general.tournyInfo.isCancelled)
+		stage === stages.PLAYING
+		&& phase === phases.CHANCELLOR_VOTE_ON_VETO
+		&& userKey === chancellor
 	) {
-		game.private.lock.selectChancellorVoteOnVeto = true;
+		await groups.remove('loader', userKey, gameKey);
 
-		game.publicPlayersState[chancellorIndex].isLoader = false;
+		await games.setCard(gameKey, userKey, {
+			displayed: true,
+			front: 'ballot',
+			back: {
+				name: data.vote ? 'ja' : 'nein'
+			}
+		});
 
-		chancellor.cardFlingerState[0].action = chancellor.cardFlingerState[1].action = '';
-		chancellor.cardFlingerState[0].cardStatus.isFlipped = chancellor.cardFlingerState[1].cardStatus.isFlipped = false;
+		await games.writeChannel(gameKey, channels.GAME.PUBLIC, {
+			timestamp: new Date(),
+			chat: [
+				{ text: 'Chancellor ' },
+				{
+					text: game.general.blindMode ? `{${seats.indexOf(userKey) + 1}}` : `${userKey} {${seats.indexOf(userKey) + 1}}`,
+					type: 'player'
+				},
+				{
+					text: data.vote ? ' has voted to veto this election.' : ' has voted not to veto this election.'
+				}
+			]
+		});
 
 		if (data.vote) {
-			chancellor.cardFlingerState[0].notificationStatus = 'selected';
-			chancellor.cardFlingerState[1].notificationStatus = '';
+			/* They voted ja; the veto continues to the president */
+			await phaseTransition(phases.PRESIDENT_VOTE_ON_VETO);
 		} else {
-			chancellor.cardFlingerState[0].notificationStatus = '';
-			chancellor.cardFlingerState[1].notificationStatus = 'selected';
+			/* The veto fails */
 		}
-
-		publicChancellor.cardStatus = {
-			cardDisplayed: true,
-			cardFront: 'ballot',
-			cardBack: {
-				cardName: data.vote ? 'ja' : 'nein'
-			}
-		};
-
-		sendInProgressGameUpdate(game);
-
-		setTimeout(
-			() => {
-				const chat = {
-					timestamp: new Date(),
-					gameChat: true,
-					chat: [
-						{ text: 'Chancellor ' },
-						{
-							text: game.general.blindMode ? `{${chancellorIndex + 1}}` : `${passport.user} {${chancellorIndex + 1}}`,
-							type: 'player'
-						},
-						{
-							text: data.vote ? ' has voted to veto this election.' : ' has voted not to veto this election.'
-						}
-					]
-				};
-
-				if (!game.general.disableGamechat) {
-					game.private.seatedPlayers.forEach(player => {
-						player.gameChats.push(chat);
-					});
-
-					game.private.unSeatedGameChats.push(chat);
-				}
-
-				publicChancellor.cardStatus.isFlipped = true;
-				sendInProgressGameUpdate(game);
-
-				if (data.vote) {
-					president.cardFlingerState = [
-						{
-							position: 'middle-left',
-							notificationStatus: '',
-							action: 'active',
-							cardStatus: {
-								isFlipped: false,
-								cardFront: 'ballot',
-								cardBack: 'ja'
-							}
-						},
-						{
-							position: 'middle-right',
-							action: 'active',
-							notificationStatus: '',
-							cardStatus: {
-								isFlipped: false,
-								cardFront: 'ballot',
-								cardBack: 'nein'
-							}
-						}
-					];
-
-					if (!game.general.disableGamechat) {
-						president.gameChats.push({
-							gameChat: true,
-							timestamp: new Date(),
-							chat: [
-								{
-									text:
-										'You must vote whether or not to veto these policies.  Select Ja to veto the policies you passed to the Chancellor or select Nein to enact the policy the Chancellor has chosen in secret.'
-								}
-							]
-						});
-					}
-
-					game.general.status = 'President to vote on policy veto.';
-					sendInProgressGameUpdate(game);
-					setTimeout(
-						() => {
-							president.cardFlingerState[0].cardStatus.isFlipped = president.cardFlingerState[1].cardStatus.isFlipped = true;
-							president.cardFlingerState[0].notificationStatus = president.cardFlingerState[1].notificationStatus = 'notification';
-							chancellor.cardFlingerState = [];
-							game.publicPlayersState[game.gameState.presidentIndex].isLoader = true;
-							game.gameState.phase = 'presidentVoteOnVeto';
-							sendInProgressGameUpdate(game);
-
-							if (game.general.timedMode) {
-								if (game.private.timerId) {
-									clearTimeout(game.private.timerId);
-									game.private.timerId = null;
-								}
-								game.gameState.timedModeEnabled = true;
-								game.private.timerId = setTimeout(
-									() => {
-										if (game.gameState.timedModeEnabled) {
-											game.gameState.timedModeEnabled = false;
-											selectPresidentVoteOnVeto({ user: president.userName }, game, { vote: Boolean(Math.floor(Math.random() * 2)) }, socket);
-										}
-									},
-									process.env.DEVTIMEDDELAY ? process.env.DEVTIMEDDELAY : game.general.timedMode * 1000
-								);
-							}
-						},
-						process.env.NODE_ENV === 'development' ? 100 : experiencedMode ? 500 : 1000
-					);
-				} else {
-					game.gameState.audioCue = 'failedVeto';
-					sendInProgressGameUpdate(game);
-					setTimeout(
-						() => {
-							game.gameState.audioCue = '';
-							publicChancellor.cardStatus.cardDisplayed = false;
-							chancellor.cardFlingerState = [];
-							setTimeout(() => {
-								publicChancellor.cardStatus.isFlipped = false;
-							}, 1000);
-							enactPolicy(game, game.private.currentElectionPolicies[0], socket);
-						},
-						process.env.NODE_ENV === 'development' ? 100 : experiencedMode ? 500 : 2000
-					);
-				}
-			},
-			process.env.NODE_ENV === 'development' ? 100 : experiencedMode ? 500 : 2000
-		);
 	}
 };
 
@@ -705,8 +343,7 @@ const selectChancellorPolicy = (passport, game, data, wasTimer, socket) => {
 		!game.private.lock.selectChancellorPolicy &&
 		chancellor &&
 		chancellor.cardFlingerState &&
-		chancellor.cardFlingerState.length &&
-		!(game.general.isTourny && game.general.tournyInfo.isCancelled)
+		chancellor.cardFlingerState.length
 	) {
 		if (!wasTimer && !game.general.private) {
 			if (
@@ -947,8 +584,7 @@ const selectPresidentPolicy = (passport, game, data, wasTimer, socket) => {
 		president.cardFlingerState &&
 		president.cardFlingerState.length &&
 		Number.isInteger(chancellorIndex) &&
-		game.publicPlayersState[chancellorIndex] &&
-		!(game.general.isTourny && game.general.tournyInfo.isCancelled)
+		game.publicPlayersState[chancellorIndex]
 	) {
 		if (game.general.timedMode && game.private.timerId) {
 			clearTimeout(game.private.timerId);
@@ -1267,13 +903,13 @@ const selectPresidentPolicy = (passport, game, data, wasTimer, socket) => {
 module.exports.selectPresidentPolicy = selectPresidentPolicy;
 
 /**
- * @param {object} passport - socket authentication.
- * @param {object} game - target game.
- * @param {object} data from socket emit
- * @param {object} socket - socket
+ * @param {object} socket - A socket
+ * @param {string} userKey - A user cache key
+ * @param {string} gameKey - A game cache key
+ * @param {object} data - Message payload
  * @param {bool} force - if action was forced
  */
-module.exports.selectVoting = (passport, game, data, socket, force = false) => {
+module.exports.selectVoting = (socket, userKey, gamKeye, data, force = false) => {
 	const { seatedPlayers } = game.private;
 	const { experiencedMode } = game.general;
 	const player = seatedPlayers.find(player => player.userName === passport.user);
@@ -1678,10 +1314,6 @@ module.exports.selectVoting = (passport, game, data, socket, force = false) => {
 			process.env.NODE_ENV === 'development' ? 2100 : isConsensus ? 1500 : 6000
 		);
 	};
-
-	if (game.general.isTourny && game.general.tournyInfo.isCancelled) {
-		return;
-	}
 
 	if (game.private.lock.selectChancellor) {
 		game.private.lock.selectChancellor = false;

@@ -14,8 +14,6 @@ const Game = new Schema({
 	rebalance9p: Boolean,
 	rerebalance9p: Boolean,
 	rebalance9p2f: Boolean,
-	isTournyFirstRound: Boolean,
-	isTournySecondRound: Boolean,
 	casualGame: Boolean,
 	customGame: Boolean,
 	isVerifiedOnly: Boolean,

@@ -22,7 +22,7 @@ if (cluster.isMaster) {
 
 		workers[i].on('exit', function(code, signal) {
 			console.log('respawning worker', i);
-			spawn(i);
+			//spawn(i);
 		});
 	};
 

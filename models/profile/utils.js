@@ -193,22 +193,3 @@ function updateProfiles(game, options = {}) {
 
 	return Promise.all(game.players.map(p => p.username).map(username => updateProfile(username, game, options)));
 }
-
-// side effect: caches profile
-function getProfile(username) {
-	const profile = profiles.get(username);
-
-	if (profile) {
-		debug('Cache hit for: %s', username);
-		return Promise.resolve(profile);
-	} else {
-		debug('Cache miss for: %s', username);
-		return Profile.findById(username)
-			.exec()
-			.then(profile => profiles.push(profile));
-	}
-}
-
-module.exports.updateProfiles = updateProfiles;
-module.exports.profileDelta = profileDelta;
-module.exports.getProfile = getProfile;

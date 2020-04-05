@@ -11,7 +11,7 @@ module.exports.policyPeek = game => {
 	const { presidentIndex } = game.gameState;
 	const president = seatedPlayers[presidentIndex];
 
-	if (!game.private.lock.policyPeek && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.policyPeek) {
 		game.private.lock.policyPeek = true;
 
 		if (game.gameState.undrawnPolicyCount < 3) {
@@ -54,7 +54,7 @@ module.exports.selectPolicies = (passport, game, socket) => {
 		game.gameState.timedModeEnabled = false;
 	}
 
-	if (!game.private.lock.selectPolicies && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectPolicies) {
 		game.private.lock.selectPolicies = true;
 		game.publicPlayersState[presidentIndex].isLoader = false;
 
@@ -208,7 +208,7 @@ module.exports.policyPeekAndDrop = game => {
 	const { presidentIndex } = game.gameState;
 	const president = seatedPlayers[presidentIndex];
 
-	if (!game.private.lock.policyPeekAndDrop && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.policyPeekAndDrop) {
 		game.private.lock.policyPeekAndDrop = true;
 
 		if (game.gameState.undrawnPolicyCount < 3) {
@@ -256,7 +256,7 @@ module.exports.selectOnePolicy = (passport, game) => {
 		game.gameState.timedModeEnabled = false;
 	}
 
-	if (!game.private.lock.selectOnePolicy && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectOnePolicy) {
 		game.private.lock.selectOnePolicy = true;
 		game.publicPlayersState[presidentIndex].isLoader = false;
 
@@ -476,7 +476,7 @@ module.exports.selectBurnCard = (passport, game, data, socket) => {
 		return;
 	}
 
-	if (!game.private.lock.selectBurnCard && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectBurnCard) {
 		game.private.lock.selectBurnCard = true;
 
 		game.private.summary = game.private.summary.updateLog({
@@ -596,7 +596,7 @@ module.exports.investigateLoyalty = game => {
 		return;
 	}
 
-	if (!game.private.lock.investigateLoyalty && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.investigateLoyalty) {
 		game.private.lock.investigateLoyalty = true;
 
 		game.general.status = 'Waiting for President to investigate.';
@@ -659,7 +659,7 @@ module.exports.selectPartyMembershipInvestigate = (passport, game, data, socket)
 		return;
 	}
 
-	if (!game.private.lock.selectPartyMembershipInvestigate && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectPartyMembershipInvestigate) {
 		game.private.lock.selectPartyMembershipInvestigate = true;
 
 		if (!seatedPlayers[playerIndex].isDead && !seatedPlayers[playerIndex].wasInvestigated) {
@@ -805,7 +805,7 @@ module.exports.showPlayerLoyalty = game => {
 	const { presidentIndex } = game.gameState;
 	const president = seatedPlayers[presidentIndex];
 
-	if (!game.private.lock.showPlayerLoyalty && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.showPlayerLoyalty) {
 		game.private.lock.showPlayerLoyalty = true;
 
 		game.general.status = 'Waiting for President to show their party.';
@@ -866,7 +866,7 @@ module.exports.selectPartyMembershipInvestigateReverse = (passport, game, data, 
 		return;
 	}
 
-	if (!game.private.lock.selectPartyMembershipInvestigateReverse && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectPartyMembershipInvestigateReverse) {
 		game.private.lock.selectPartyMembershipInvestigateReverse = true;
 
 		const targetPlayer = seatedPlayers[playerIndex];
@@ -1029,7 +1029,7 @@ module.exports.specialElection = game => {
 	const { presidentIndex } = game.gameState;
 	const president = seatedPlayers[presidentIndex];
 
-	if (!game.private.lock.specialElection && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.specialElection) {
 		game.private.lock.specialElection = true;
 		game.general.status = 'President to select special election.';
 		game.gameState.specialElectionFormerPresidentIndex = presidentIndex;
@@ -1094,7 +1094,7 @@ module.exports.selectSpecialElection = (passport, game, data, socket) => {
 		game.gameState.timedModeEnabled = false;
 	}
 
-	if (!game.private.lock.selectSpecialElection && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectSpecialElection) {
 		game.private.lock.selectSpecialElection = true;
 
 		game.private.summary = game.private.summary.updateLog({
@@ -1158,7 +1158,7 @@ module.exports.executePlayer = game => {
 	const { presidentIndex } = game.gameState;
 	const president = seatedPlayers[presidentIndex];
 
-	if (!game.private.lock.executePlayer && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.executePlayer) {
 		game.private.lock.executePlayer = true;
 		game.general.status = 'President to execute a player.';
 		game.publicPlayersState[presidentIndex].isLoader = true;
@@ -1267,7 +1267,7 @@ module.exports.selectPlayerToExecute = (passport, game, data, socket) => {
 		game.gameState.timedModeEnabled = false;
 	}
 
-	if (!game.private.lock.selectPlayerToExecute && !(game.general.isTourny && game.general.tournyInfo.isCancelled)) {
+	if (!game.private.lock.selectPlayerToExecute) {
 		game.gameState.audioCue = 'selectedExecution';
 		game.private.lock.selectPlayerToExecute = true;
 
@@ -1456,7 +1456,7 @@ module.exports.selectPlayerToExecute = (passport, game, data, socket) => {
 								const index = game.trackState.enactedPolicies.length;
 								const policy = game.private.policies.shift();
 								game.trackState[`${policy}PolicyCount`]++;
-								sendGameList();
+								;
 								game.trackState.enactedPolicies.push({
 									position: 'middle',
 									cardBack: policy,
